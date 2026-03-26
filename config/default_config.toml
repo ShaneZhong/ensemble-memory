@@ -1,0 +1,42 @@
+# Ensemble Memory System — Default Configuration
+# Copied to ~/.ensemble_memory/config.toml by install.sh
+# Override any value in your personal config.toml.
+
+[general]
+# Ollama model used for memory extraction
+model = "qwen2.5:3b"
+
+# LLM sampling temperature (lower = more deterministic)
+temperature = 0.2
+
+# Hard timeout in seconds for each Ollama extraction call
+timeout_seconds = 3
+
+# Directory where daily YYYY-MM-DD.md logs are written
+# Overridden at runtime by ENSEMBLE_MEMORY_LOGS env var
+log_dir = "~/.ensemble_memory/memory"
+
+[triage]
+# Minimum signal tier required to trigger LLM extraction.
+# Tier 1 = explicit user corrections (highest priority)
+# Tier 4 = decisions / directional statements
+# Set to 4 to only trigger on decisions+corrections; 1 = anything detected
+min_tier = 1
+
+[extraction]
+# Maximum tokens Ollama may generate per extraction response
+max_tokens = 1024
+
+# Retry with a simplified summary-only prompt on JSON schema validation failure
+retry_on_failure = true
+
+# Append per-call stats to logs/extraction_stats.jsonl for success rate tracking
+track_stats = true
+
+[logging]
+# Directory for raw extraction JSONL and missed-turn logs
+# Overridden at runtime by ENSEMBLE_MEMORY_DIR env var
+data_dir = "~/.ensemble_memory"
+
+# Log turns that timed out to logs/missed_turns.jsonl for later batch reprocessing
+log_missed_turns = true
