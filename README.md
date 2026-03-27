@@ -14,8 +14,8 @@ Claude Code session
 [User types a prompt]
     |
     v
-[UserPromptSubmit hook] ──> Embed prompt ──> Find similar memories ──> Inject relevant ones
-    |                        (~5ms)           (cosine similarity)       as additionalContext
+[UserPromptSubmit hook] ──> Query daemon ──> Find similar memories ──> Inject relevant ones
+    |                        (~50ms)          (cosine similarity)       via hookSpecificOutput
     v
 [Claude responds]
     |
@@ -28,13 +28,17 @@ Claude Code session
                                       [Ollama qwen2.5:3b ~9s]
                                               |
                                               v
-                                   [SQLite + Embedding + Markdown write]
+                                   [SQLite + Markdown write]
+                                              |
+                                              v
+                                   [Daemon /embed + /invalidate_cache]
 ```
 
-**Three hooks, three jobs:**
+**Three hooks + one daemon:**
 1. **SessionStart** — loads standing rules as baseline context
-2. **UserPromptSubmit** — retrieves semantically relevant memories for each prompt
+2. **UserPromptSubmit** — queries the embedding daemon for semantically relevant memories
 3. **Stop** — captures new corrections and decisions after each response
+4. **Embedding daemon** — persistent background process (port 9876) that loads the ML model once (~200MB), serves embedding + search requests in ~50ms
 
 ## What Gets Captured
 
@@ -61,6 +65,9 @@ git clone https://github.com/ShaneZhong/ensemble-memory.git
 cd ensemble-memory
 pip install sentence-transformers
 ./install.sh
+
+# Start the embedding daemon
+bash daemon/daemon_ctl.sh start
 ```
 
 `install.sh` will:
@@ -68,6 +75,14 @@ pip install sentence-transformers
 2. Check Ollama is installed and pull `qwen2.5:3b` if needed
 3. Copy default config to `~/.ensemble_memory/config.toml`
 4. Register hooks in Claude Code's `~/.claude/hooks.json`
+
+The embedding daemon auto-starts when hooks detect it's down, but you can manage it manually:
+```bash
+bash daemon/daemon_ctl.sh start    # Start daemon
+bash daemon/daemon_ctl.sh stop     # Stop daemon
+bash daemon/daemon_ctl.sh status   # Check status
+bash daemon/daemon_ctl.sh restart  # Restart
+```
 
 Then add the hooks to your `~/.claude/settings.json`:
 ```json
@@ -154,8 +169,11 @@ Full design: [final_design.md](../synthesis/final_design.md) (1,931 lines)
 
 ```
 ensemble-memory/
+├── daemon/
+│   ├── embedding_daemon.py    # Persistent HTTP server (port 9876, ~200MB RAM)
+│   └── daemon_ctl.sh          # start/stop/restart/status management
 ├── hooks/
-│   ├── db.py                  # SQLite hub (466 lines — schema, temporal scoring, supersession)
+│   ├── db.py                  # SQLite hub (schema, temporal scoring, supersession)
 │   ├── embeddings.py          # Sentence-transformers wrapper (all-MiniLM-L6-v2, 384-dim)
 │   ├── triage.py              # Regex signal detection (< 5ms)
 │   ├── extract.py             # Ollama qwen2.5:3b caller with JSON validation + retry
@@ -163,12 +181,14 @@ ensemble-memory/
 │   ├── store_memory.py        # SQLite + embedding + markdown orchestrator
 │   ├── session_start.sh/py    # SessionStart hook — load standing rules
 │   ├── stop.sh                # Stop hook — capture corrections + decisions
-│   ├── user_prompt_submit.sh/py  # UserPromptSubmit hook — query-time retrieval
+│   ├── user_prompt_submit.sh/py  # UserPromptSubmit hook — thin HTTP client to daemon
 │   └── prompts/extraction.txt # LLM prompt template
 ├── tests/
 │   └── test_ensemble_memory.py  # 62 tests (Phase 1 + Phase 2)
 ├── config/default_config.toml
 ├── install.sh
+├── HOOKS_REFERENCE.md         # Critical: hook payload/response format docs
+├── PHASE2_REVIEW.md           # Code review findings
 └── TESTING.md
 ```
 
@@ -193,8 +213,9 @@ python3 tests/test_ensemble_memory.py
 - [x] Phase 1: Capture pipeline (regex triage → Ollama extraction → SQLite + markdown)
 - [x] Phase 1: SessionStart loading (importance >= 7 standing rules)
 - [x] Phase 2: Semantic search (sentence-transformers embeddings, cosine similarity)
-- [x] Phase 2: Query-time retrieval (UserPromptSubmit hook)
+- [x] Phase 2: Query-time retrieval (UserPromptSubmit hook via embedding daemon)
 - [x] Phase 2: Cosine supersession (replaces Jaccard for embedded memories)
+- [x] Phase 2: Persistent embedding daemon (port 9876, auto-start, 30min idle shutdown)
 - [ ] Phase 3: Knowledge graph (SQLite adjacency tables, entity extraction)
 - [ ] Phase 4: Nightly batch processor (async transcript scan)
 - [ ] Phase 5: Public skill installer (`/plugin install ensemble-memory`)

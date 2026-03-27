@@ -1,14 +1,14 @@
 # Ensemble Memory System — Test Results & Known Issues
 
-**Date**: 2026-03-25
-**Phase**: Phase 1 Full (SQLite hub + SessionStart loading)
-**Test Environment**: Mac Mini M4 16GB, Claude Code v2.1.81, Ollama qwen2.5:3b
+**Date**: 2026-03-28 (updated from 2026-03-25)
+**Phase**: Phase 2 Complete (Semantic Search + Embedding Daemon)
+**Test Environment**: Mac Mini M4 16GB, Claude Code v2.1.81, Ollama qwen2.5:3b, sentence-transformers all-MiniLM-L6-v2
 
 ---
 
 ## Test Results
 
-### Automated Tests (45/45 PASS)
+### Automated Tests (62/62 PASS)
 
 Run: `cd ai_memory/ensemble-memory && python3 tests/test_ensemble_memory.py`
 
@@ -19,19 +19,29 @@ Run: `cd ai_memory/ensemble-memory && python3 tests/test_ensemble_memory.py`
 | Write Log (markdown) | 4 | ALL PASS |
 | Session Start (loading) | 5 | ALL PASS |
 | Integration (end-to-end) | 3 | ALL PASS |
+| Embeddings | 9 | ALL PASS |
+| Query Retrieval | 5 | ALL PASS |
+| Cosine Supersession | 3 | ALL PASS |
 
-### Live Tests
+### Phase 1 Live Tests (2026-03-25)
 
 | Test | Input | Expected | Result | Notes |
 |------|-------|----------|--------|-------|
-| **Test 1: Correction** | "no, don't use system Python. Always use the .venv Python." | Tier 1 correction captured | **PASS** | importance 7, type correction |
-| **Test 2: Decision** | "let's use SQLite for the database instead of PostgreSQL" | Tier 4 decision captured | **PASS** | importance 6, type semantic |
-| **Test 3: No false positive** | "can you read the file at ai_memory/progress.md" | No memory entry | **PASS** | Regex correctly found no signals |
-| **Test 4: SessionEnd** | N/A | N/A | **SKIPPED** | SessionEnd hook disabled — will become nightly batch job |
-| **Test A: SessionStart injection** | Start new session | Memories injected as additionalContext | **PARTIAL** | Hook fires, context injected, but Claude treats it as background info, not directives |
-| **Test B: Correction to SQLite** | (pending) | New correction written to both SQLite + markdown | PENDING | |
-| **Test C: Supersession live** | (pending) | Old memory marked superseded in SQLite | PENDING | |
-| **Test D: Low-signal ignored** | (pending) | No memory entry created | PENDING | |
+| **Test 1: Correction** | "no, don't use system Python" | Tier 1 captured | **PASS** | importance 7 |
+| **Test 2: Decision** | "let's use SQLite for the database" | Tier 4 captured | **PASS** | importance 6 |
+| **Test 3: No false positive** | "can you read the file at progress.md" | No memory entry | **PASS** | Regex found no signals |
+| **Test A: SessionStart** | Start new session | Memories injected | **PASS** | Context loaded via additionalContext |
+| **Test B: Correction to SQLite** | "don't use tabs, use 4 spaces" | Captured to SQLite + markdown | **PASS** | After transcript parser fix |
+| **Test C: Supersession** | "use 2 spaces instead of 4" | Memory captured | **PARTIAL** | Captured but Jaccard too strict (0.23 < 0.6) |
+| **Test D: No false positive** | "what files are in ai_memory" | No memory stored | **PASS** | After user-only triage fix |
+
+### Phase 2 Live Tests (2026-03-27/28)
+
+| Test | Input | Expected | Result | Notes |
+|------|-------|----------|--------|-------|
+| **Test 4: Capture + embed** | "don't use print, use logging" | Captured with embedding | **PASS** | After embed-via-daemon fix |
+| **Test 5: Retrieve correction** | "how to add debug output" | Logging memory retrieved | **PASS** | Claude responded with `logging` module |
+| **Test 6: Unique memory** | "what is the project mascot?" | Retrieves "Koda the blue kangaroo" | **PASS** | Memory only in ensemble-memory, NOT in CLAUDE.md/MEMORY.md. Proves retrieval is 100% from our system |
 
 ---
 
