@@ -80,26 +80,34 @@ try:
             msg_type = entry.get("type", "")
             role = entry.get("role", "")
 
-            # Handle both flat {type, message} and nested {role, content} formats
+            # Handle flat {type, message} and nested {role, content} formats.
+            # message can be: str, dict (with 'content' key), or list of blocks.
+            def extract_text(raw):
+                """Extract plain text from any message format."""
+                if isinstance(raw, str):
+                    return raw.strip()
+                if isinstance(raw, dict):
+                    inner = raw.get("content", "")
+                    return extract_text(inner)  # recurse
+                if isinstance(raw, list):
+                    texts = []
+                    for block in raw:
+                        if isinstance(block, dict):
+                            if block.get("type") == "text":
+                                texts.append(block.get("text", ""))
+                            elif block.get("type") == "tool_result":
+                                pass  # skip tool results — not user text
+                    return " ".join(texts).strip()
+                return ""
+
             if msg_type == "user" or role == "user":
-                content = entry.get("message") or entry.get("content") or ""
-                if isinstance(content, list):
-                    # Extract text from content blocks
-                    content = " ".join(
-                        block.get("text", "") for block in content
-                        if isinstance(block, dict) and block.get("type") == "text"
-                    )
+                content = extract_text(entry.get("message") or entry.get("content") or "")
                 if content:
-                    last_user = str(content)
+                    last_user = content
             elif msg_type == "assistant" or role == "assistant":
-                content = entry.get("message") or entry.get("content") or ""
-                if isinstance(content, list):
-                    content = " ".join(
-                        block.get("text", "") for block in content
-                        if isinstance(block, dict) and block.get("type") == "text"
-                    )
+                content = extract_text(entry.get("message") or entry.get("content") or "")
                 if content:
-                    last_assistant = str(content)
+                    last_assistant = content
 except OSError:
     pass
 
