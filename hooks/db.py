@@ -10,6 +10,7 @@ Env vars:
 """
 
 import hashlib
+import json
 import math
 import os
 import sqlite3
@@ -161,6 +162,60 @@ def get_db() -> sqlite3.Connection:
     conn.executescript(_DDL)
     conn.commit()
     return conn
+
+
+def ensure_embedding_column():
+    """Add embedding column if it doesn't exist (migration for Phase 2)."""
+    conn = get_db()
+    try:
+        conn.execute("SELECT embedding FROM memories LIMIT 1")
+    except sqlite3.OperationalError:
+        conn.execute("ALTER TABLE memories ADD COLUMN embedding TEXT")
+        conn.commit()
+    conn.close()
+
+
+ensure_embedding_column()
+
+
+def store_embedding(memory_id: str, embedding: list[float]):
+    """Store embedding vector for a memory."""
+    conn = get_db()
+    conn.execute(
+        "UPDATE memories SET embedding = ? WHERE id = ?",
+        (json.dumps(embedding), memory_id)
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_memories_with_embeddings(project=None, min_importance=1):
+    """Get all active memories with their embeddings for similarity search."""
+    conn = get_db()
+    conn.row_factory = sqlite3.Row
+    query = """
+        SELECT id, content, memory_type, importance, embedding,
+               created_at, access_count, decay_rate, stability
+        FROM memories
+        WHERE superseded_by IS NULL
+          AND gc_eligible = 0
+          AND importance >= ?
+          AND embedding IS NOT NULL
+    """
+    params = [min_importance]
+    if project:
+        query += " AND (project = ? OR project LIKE ? || '/%' OR ? LIKE project || '/%')"
+        params.extend([project, project, project])
+    rows = conn.execute(query, params).fetchall()
+    conn.close()
+
+    result = []
+    for row in rows:
+        d = dict(row)
+        if d['embedding']:
+            d['embedding'] = json.loads(d['embedding'])
+        result.append(d)
+    return result
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
@@ -380,11 +435,13 @@ def detect_content_supersession(
     new_content: str,
     new_memory_type: str,
     threshold: float = 0.6,
+    new_embedding: Optional[list[float]] = None,
 ) -> Optional[str]:
     """Find existing active memories with similar content and supersede them.
 
-    Uses word-level Jaccard similarity. If an existing memory of the same type
-    has similarity >= threshold with the new content, the old one is superseded.
+    If new_embedding is provided and candidates have embeddings, uses cosine
+    similarity with threshold 0.85. Falls back to word-level Jaccard similarity
+    with the supplied threshold (default 0.6) when embeddings are unavailable.
     Returns the superseded memory id, or None.
     """
     conn = get_db()
@@ -392,7 +449,7 @@ def detect_content_supersession(
 
     rows = conn.execute(
         """
-        SELECT id, content FROM memories
+        SELECT id, content, embedding FROM memories
         WHERE memory_type = ?
           AND superseded_by IS NULL
           AND gc_eligible = 0
@@ -407,10 +464,24 @@ def detect_content_supersession(
     best_similarity = 0.0
 
     for row in rows:
-        sim = _jaccard_similarity(new_content, row["content"])
-        if sim >= threshold and sim > best_similarity:
-            best_similarity = sim
-            best_match_id = row["id"]
+        candidate_embedding_raw = row["embedding"]
+        # Use cosine similarity when both sides have embeddings
+        if new_embedding and candidate_embedding_raw:
+            candidate_embedding = json.loads(candidate_embedding_raw)
+            try:
+                import embeddings as _emb
+                sim = _emb.cosine_similarity(new_embedding, candidate_embedding)
+            except ImportError:
+                sim = _jaccard_similarity(new_content, row["content"])
+            cosine_threshold = 0.85
+            if sim >= cosine_threshold and sim > best_similarity:
+                best_similarity = sim
+                best_match_id = row["id"]
+        else:
+            sim = _jaccard_similarity(new_content, row["content"])
+            if sim >= threshold and sim > best_similarity:
+                best_similarity = sim
+                best_match_id = row["id"]
 
     if not best_match_id:
         conn.close()

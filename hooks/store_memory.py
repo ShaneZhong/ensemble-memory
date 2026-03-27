@@ -25,6 +25,12 @@ import os
 import db
 import write_log
 
+try:
+    import embeddings as emb
+    HAS_EMBEDDINGS = True
+except ImportError:
+    HAS_EMBEDDINGS = False
+
 # Promotion threshold: if a procedural memory is reinforced this many times
 # within the window, log it as a candidate for CLAUDE.md promotion.
 PROMOTION_THRESHOLD = 5
@@ -59,8 +65,19 @@ def _store_to_sqlite(memories: list[dict], session_id: str) -> tuple[int, list[s
                 continue  # don't insert a new row
 
         # ── Insert new memory ─────────────────────────────────────────────────
+        content = mem.get("content", "")
         mem_id = db.insert_memory(mem, session_id, PROJECT)
         new_count += 1
+
+        # ── Generate and store embedding for this memory ──────────────────────
+        embedding = None
+        if HAS_EMBEDDINGS:
+            try:
+                embedding = emb.get_embedding(content)
+                if embedding:
+                    db.store_embedding(mem_id, embedding)
+            except Exception:
+                pass  # Embeddings are best-effort
 
         # ── Supersession check (structured: subject+predicate match) ─────────
         subject = mem.get("subject", "")
@@ -72,9 +89,8 @@ def _store_to_sqlite(memories: list[dict], session_id: str) -> tuple[int, list[s
 
         # ── Content-similarity supersession (fallback when no structured triple) ─
         if not subject or not predicate:
-            content = mem.get("content", "")
             superseded = db.detect_content_supersession(
-                mem_id, content, mem_type, threshold=0.6
+                mem_id, content, mem_type, threshold=0.6, new_embedding=embedding
             )
             if superseded:
                 superseded_ids.append(superseded)
