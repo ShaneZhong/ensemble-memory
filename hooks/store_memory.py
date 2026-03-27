@@ -26,12 +26,6 @@ import os
 import db
 import write_log
 
-try:
-    import embeddings as emb
-    HAS_EMBEDDINGS = True
-except ImportError:
-    HAS_EMBEDDINGS = False
-
 # Promotion threshold: if a procedural memory is reinforced this many times
 # within the window, log it as a candidate for CLAUDE.md promotion.
 PROMOTION_THRESHOLD = 5
@@ -85,13 +79,21 @@ def _store_to_sqlite(memories: list[dict], session_id: str) -> tuple[int, list[s
         mem_id = db.insert_memory(mem, session_id, PROJECT)
         new_count += 1
 
-        # ── Generate and store embedding for this memory ──────────────────────
+        # ── Generate and store embedding via daemon (/embed endpoint) ────────
         embedding = None
-        if HAS_EMBEDDINGS:
-            try:
-                embedding = emb.get_embedding(content)
-                if embedding:
-                    db.store_embedding(mem_id, embedding)
+        try:
+            payload = json.dumps({"text": content}).encode()
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{DAEMON_PORT}/embed",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=1.0) as resp:
+                result = json.loads(resp.read())
+                embedding = result.get("embedding")
+            if embedding:
+                db.store_embedding(mem_id, embedding)
             except Exception:
                 pass  # Embeddings are best-effort
 
