@@ -96,7 +96,12 @@ def main() -> None:
         print("{}")
         return
 
-    print(json.dumps({"additionalContext": context}, ensure_ascii=False))
+    print(json.dumps({
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": context,
+        }
+    }, ensure_ascii=False))
 
 
 if __name__ == "__main__":

@@ -30,35 +30,16 @@ fi
 
 # ── Extract session_id, message text, and cwd from payload ───────────────────
 # Prefer jq if available; fall back to python3 for portability.
+# Claude Code sends: {"session_id":"...", "prompt":"user text", "cwd":"..."}
 if command -v jq >/dev/null 2>&1; then
     SESSION_ID="$(printf '%s' "$PAYLOAD" | jq -r '.session_id // ""')"
-    MESSAGE_TEXT="$(printf '%s' "$PAYLOAD" | jq -r '
-        if .message | type == "string" then .message
-        elif .message | type == "object" then
-            if .message.content | type == "string" then .message.content
-            elif .message.content | type == "array" then
-                [.message.content[] | select(.type == "text") | .text] | join(" ")
-            else ""
-            end
-        else ""
-        end
-    ')"
+    MESSAGE_TEXT="$(printf '%s' "$PAYLOAD" | jq -r '.prompt // ""')"
     HOOK_CWD="$(printf '%s' "$PAYLOAD" | jq -r '.cwd // ""')"
 else
     SESSION_ID="$(printf '%s' "$PAYLOAD" | "$PYTHON3" -c "
 import json, sys; d=json.load(sys.stdin); print(d.get('session_id',''))")"
     MESSAGE_TEXT="$(printf '%s' "$PAYLOAD" | "$PYTHON3" -c "
-import json, sys
-d = json.load(sys.stdin)
-msg = d.get('message', '')
-if isinstance(msg, str): print(msg)
-elif isinstance(msg, dict):
-    content = msg.get('content', '')
-    if isinstance(content, str): print(content)
-    elif isinstance(content, list):
-        print(' '.join(b.get('text','') for b in content if isinstance(b,dict) and b.get('type')=='text'))
-    else: print('')
-else: print('')")"
+import json, sys; d=json.load(sys.stdin); print(d.get('prompt',''))")"
     HOOK_CWD="$(printf '%s' "$PAYLOAD" | "$PYTHON3" -c "
 import json, sys; d=json.load(sys.stdin); print(d.get('cwd',''))")"
 fi
