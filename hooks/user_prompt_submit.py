@@ -8,8 +8,8 @@ Env vars:
     ENSEMBLE_MEMORY_DAEMON_PORT  Daemon port (default: 9876)
 
 Output:
-    {"additionalContext": "...formatted memories..."} — when relevant memories found
-    {}                                                 — when nothing found or daemon down
+    {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": "..."}} — when relevant
+    {}  — when nothing found or daemon down
 """
 
 import json

@@ -35,8 +35,22 @@ if [[ -z "$PAYLOAD" ]]; then
     exit 0
 fi
 
+# ── Check stop_hook_active to prevent infinite loops ─────────────────────────
+# Per Claude Code docs: stop_hook_active=true means Claude is already continuing
+# from a previous Stop hook. Skip processing to avoid re-triggering.
+if command -v jq >/dev/null 2>&1; then
+    STOP_ACTIVE="$(printf '%s' "$PAYLOAD" | jq -r '.stop_hook_active // false')"
+else
+    STOP_ACTIVE="$(printf '%s' "$PAYLOAD" | "$PYTHON3" -c \
+        "import json,sys; d=json.load(sys.stdin); print(str(d.get('stop_hook_active',False)).lower())")"
+fi
+if [[ "$STOP_ACTIVE" == "true" ]]; then
+    exit 0
+fi
+
 # ── Extract session_id and transcript_path from payload ──────────────────────
-# Prefer jq if available; fall back to python3 -c for portability.
+# Claude Code Stop hook sends: {session_id, transcript_path, cwd, permission_mode,
+#   hook_event_name, stop_hook_active, last_assistant_message}
 if command -v jq >/dev/null 2>&1; then
     SESSION_ID="$(printf '%s' "$PAYLOAD" | jq -r '.session_id // ""')"
     TRANSCRIPT_PATH="$(printf '%s' "$PAYLOAD" | jq -r '.transcript_path // ""')"
