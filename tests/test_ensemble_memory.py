@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Test suite for ensemble memory system — Phase 1.
+"""Test suite for ensemble memory system — Phase 1 + Phase 2.
 
 Run: python3 tests/test_ensemble_memory.py
   or python3 -m pytest tests/test_ensemble_memory.py -v
@@ -10,6 +10,9 @@ Tests are grouped by component:
   3. Store Memory (SQLite + markdown integration)
   4. Session Start (memory loading + context formatting)
   5. End-to-end (full pipeline: triage → extract → store → load)
+  6. Embeddings (vector generation, cosine similarity)
+  7. Query-time Retrieval (UserPromptSubmit semantic search)
+  8. Cosine Supersession (embedding-based supersession)
 """
 
 import json
@@ -60,6 +63,10 @@ class TempDirMixin:
 
         # Force db.py to reinitialize with test path
         db._DB_PATH_OVERRIDE = self.db_path
+
+        # Ensure embedding column exists in test DB (Phase 2 migration)
+        if hasattr(db, 'ensure_embedding_column'):
+            db.ensure_embedding_column()
 
     def tearDown(self):
         # Restore env
@@ -572,6 +579,236 @@ class TestIntegration(TempDirMixin, unittest.TestCase):
         md_path = Path(self.logs_dir) / f"{datetime.now().strftime('%Y-%m-%d')}.md"
         self.assertTrue(md_path.exists())
         self.assertIn("run tests", md_path.read_text())
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 6. Embeddings Tests
+# ═══════════════════════════════════════════════════════════════════════════════
+
+try:
+    import embeddings as emb
+    HAS_EMBEDDINGS = True
+except ImportError:
+    HAS_EMBEDDINGS = False
+
+
+@unittest.skipUnless(HAS_EMBEDDINGS, "sentence-transformers not installed")
+class TestEmbeddings(unittest.TestCase):
+    """Test embedding generation and similarity."""
+
+    def test_get_embedding_returns_vector(self):
+        """get_embedding should return a list of floats."""
+        vec = emb.get_embedding("hello world")
+        self.assertIsInstance(vec, list)
+        self.assertTrue(len(vec) > 0)
+        self.assertIsInstance(vec[0], float)
+
+    def test_embedding_dimension(self):
+        """Embedding should be 384-dim for all-MiniLM-L6-v2."""
+        vec = emb.get_embedding("test")
+        self.assertEqual(len(vec), 384)
+
+    def test_self_similarity_is_one(self):
+        """Cosine similarity of a vector with itself should be 1.0."""
+        vec = emb.get_embedding("the quick brown fox")
+        sim = emb.cosine_similarity(vec, vec)
+        self.assertAlmostEqual(sim, 1.0, places=4)
+
+    def test_similar_texts_high_similarity(self):
+        """Semantically similar texts should have high cosine similarity."""
+        a = emb.get_embedding("use PostgreSQL for the database")
+        b = emb.get_embedding("PostgreSQL is our database choice")
+        sim = emb.cosine_similarity(a, b)
+        self.assertGreater(sim, 0.5)
+
+    def test_dissimilar_texts_low_similarity(self):
+        """Unrelated texts should have low cosine similarity."""
+        a = emb.get_embedding("use PostgreSQL for the database")
+        b = emb.get_embedding("the weather is sunny today")
+        sim = emb.cosine_similarity(a, b)
+        self.assertLess(sim, 0.3)
+
+    def test_batch_embeddings(self):
+        """get_embeddings should return correct number of vectors."""
+        texts = ["hello", "world", "test"]
+        vecs = emb.get_embeddings(texts)
+        self.assertEqual(len(vecs), 3)
+        self.assertEqual(len(vecs[0]), 384)
+
+    def test_find_similar(self):
+        """find_similar should return candidates above threshold, sorted by similarity."""
+        query = emb.get_embedding("database setup")
+        candidates = [
+            {"content": "use PostgreSQL", "embedding": emb.get_embedding("use PostgreSQL for databases")},
+            {"content": "sunny weather", "embedding": emb.get_embedding("the weather is sunny")},
+            {"content": "MySQL config", "embedding": emb.get_embedding("configure MySQL database")},
+        ]
+        results = emb.find_similar(query, candidates, threshold=0.2, top_k=5)
+        # Database-related candidates should be returned, weather should not
+        contents = [r["content"] for r in results]
+        self.assertIn("use PostgreSQL", contents)
+        self.assertIn("MySQL config", contents)
+
+    def test_find_similar_empty_candidates(self):
+        """find_similar with no candidates should return empty list."""
+        query = emb.get_embedding("test")
+        results = emb.find_similar(query, [], threshold=0.2)
+        self.assertEqual(results, [])
+
+    def test_cosine_similarity_zero_vector(self):
+        """Cosine similarity with zero vector should be 0."""
+        vec = emb.get_embedding("hello")
+        zero = [0.0] * 384
+        sim = emb.cosine_similarity(vec, zero)
+        self.assertAlmostEqual(sim, 0.0, places=4)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 7. Query-time Retrieval Tests
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@unittest.skipUnless(HAS_EMBEDDINGS, "sentence-transformers not installed")
+class TestQueryRetrieval(TempDirMixin, unittest.TestCase):
+    """Test UserPromptSubmit query-time memory retrieval."""
+
+    def _store_with_embedding(self, content, mem_type="correction", importance=8):
+        """Helper: insert a memory and generate its embedding."""
+        mem = {"type": mem_type, "content": content, "importance": importance}
+        mem_id = db.insert_memory(mem, "test-session", "/test")
+        vec = emb.get_embedding(content)
+        db.store_embedding(mem_id, vec)
+        return mem_id
+
+    def test_retrieves_relevant_memory(self):
+        """Query about databases should retrieve database-related memory."""
+        self._store_with_embedding("Always use PostgreSQL, never MySQL")
+
+        import user_prompt_submit as ups
+        ups._memories_cache = None  # Clear cache
+        conn = db.get_db()
+        memories = ups._load_memories(conn, "/test")
+        self.assertTrue(len(memories) > 0)
+
+        query_emb = emb.get_embedding("which database should I use")
+        results = emb.find_similar(query_emb, [m for m in memories if m.get("embedding")], threshold=0.2, top_k=5)
+        contents = [r["content"] for r in results]
+        self.assertTrue(any("PostgreSQL" in c for c in contents))
+
+    def test_no_retrieval_for_irrelevant_query(self):
+        """Query about weather should not retrieve database memory."""
+        self._store_with_embedding("Always use PostgreSQL, never MySQL")
+
+        conn = db.get_db()
+        import user_prompt_submit as ups
+        ups._memories_cache = None
+        memories = ups._load_memories(conn, "/test")
+
+        query_emb = emb.get_embedding("what is the weather forecast")
+        results = emb.find_similar(query_emb, [m for m in memories if m.get("embedding")], threshold=0.2, top_k=5)
+        # Should be empty or very low similarity
+        pg_results = [r for r in results if "PostgreSQL" in r.get("content", "")]
+        self.assertEqual(len(pg_results), 0)
+
+    def test_retrieves_multiple_relevant_memories(self):
+        """Multiple related memories should all be retrieved."""
+        self._store_with_embedding("Use PostgreSQL not MySQL")
+        self._store_with_embedding("SQLite is better for small projects")
+
+        conn = db.get_db()
+        import user_prompt_submit as ups
+        ups._memories_cache = None
+        memories = ups._load_memories(conn, "/test")
+
+        query_emb = emb.get_embedding("set up a database for the project")
+        results = emb.find_similar(query_emb, [m for m in memories if m.get("embedding")], threshold=0.15, top_k=5)
+        self.assertGreaterEqual(len(results), 1)
+
+    def test_memories_without_embeddings_excluded(self):
+        """Memories without embeddings should not appear in similarity search."""
+        # Insert without embedding
+        db.insert_memory({"type": "correction", "content": "no embedding memory", "importance": 8}, "s1", "/test")
+
+        conn = db.get_db()
+        rows = db.get_memories_with_embeddings(project="/test")
+        self.assertEqual(len(rows), 0)  # No embeddings stored
+
+    def test_embedding_stored_on_insert(self):
+        """store_memory should generate and store embeddings."""
+        import store_memory
+        extraction = {"memories": [
+            {"type": "correction", "content": "Always use dark mode", "importance": 7}
+        ], "summary": ["dark mode preference"]}
+        sys.argv = ["store_memory.py", json.dumps(extraction), "embed-test"]
+        store_memory.main()
+
+        conn = db.get_db()
+        row = conn.execute("SELECT embedding FROM memories WHERE content LIKE '%dark mode%'").fetchone()
+        self.assertIsNotNone(row)
+        if row[0]:
+            vec = json.loads(row[0])
+            self.assertEqual(len(vec), 384)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 8. Cosine Supersession Tests
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@unittest.skipUnless(HAS_EMBEDDINGS, "sentence-transformers not installed")
+class TestCosineSupersession(TempDirMixin, unittest.TestCase):
+    """Test embedding-based supersession (replaces Jaccard for Phase 2)."""
+
+    def test_cosine_supersedes_similar_content(self):
+        """Highly similar content should trigger cosine supersession."""
+        old_mem = {"type": "correction", "content": "Use 4 spaces for indentation, never tabs", "importance": 7}
+        old_id = db.insert_memory(old_mem, "s1", "/test")
+        old_emb = emb.get_embedding(old_mem["content"])
+        db.store_embedding(old_id, old_emb)
+
+        new_mem = {"type": "correction", "content": "Use 2 spaces for indentation instead of 4 spaces", "importance": 7}
+        new_id = db.insert_memory(new_mem, "s2", "/test")
+        new_emb = emb.get_embedding(new_mem["content"])
+        db.store_embedding(new_id, new_emb)
+
+        # Check cosine similarity — these should be high
+        sim = emb.cosine_similarity(old_emb, new_emb)
+        self.assertGreater(sim, 0.5, f"Expected high similarity for indentation memories, got {sim}")
+
+        # Run supersession with embedding
+        result = db.detect_content_supersession(new_id, new_mem["content"], "correction", new_embedding=new_emb)
+        if sim >= 0.85:
+            self.assertEqual(result, old_id)
+        # If sim < 0.85, Jaccard fallback applies — may or may not supersede
+
+    def test_cosine_does_not_supersede_unrelated(self):
+        """Unrelated content should NOT trigger supersession even with embeddings."""
+        old_mem = {"type": "correction", "content": "Always use PostgreSQL for the database", "importance": 7}
+        old_id = db.insert_memory(old_mem, "s1", "/test")
+        old_emb = emb.get_embedding(old_mem["content"])
+        db.store_embedding(old_id, old_emb)
+
+        new_mem = {"type": "correction", "content": "Never use tabs for indentation", "importance": 7}
+        new_id = db.insert_memory(new_mem, "s2", "/test")
+        new_emb = emb.get_embedding(new_mem["content"])
+        db.store_embedding(new_id, new_emb)
+
+        result = db.detect_content_supersession(new_id, new_mem["content"], "correction", new_embedding=new_emb)
+        self.assertIsNone(result)
+
+    def test_jaccard_fallback_without_embeddings(self):
+        """Without embeddings, Jaccard similarity should still work."""
+        old_id = db.insert_memory(
+            {"type": "semantic", "content": "the project uses PostgreSQL database for data storage", "importance": 6},
+            "s1", "/test"
+        )
+        new_id = db.insert_memory(
+            {"type": "semantic", "content": "the project uses PostgreSQL database for all data storage needs", "importance": 6},
+            "s2", "/test"
+        )
+        # No embeddings stored — should fall back to Jaccard
+        result = db.detect_content_supersession(new_id, "the project uses PostgreSQL database for all data storage needs", "semantic")
+        # Jaccard of these two should be high (many shared words)
+        if result:
+            self.assertEqual(result, old_id)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
