@@ -15,6 +15,7 @@ Env vars (passed through to write_log):
 
 import json
 import sys
+import urllib.request
 from pathlib import Path
 
 # ── Locate siblings without hardcoded paths ───────────────────────────────────
@@ -35,6 +36,21 @@ except ImportError:
 # within the window, log it as a candidate for CLAUDE.md promotion.
 PROMOTION_THRESHOLD = 5
 PROJECT = os.environ.get("ENSEMBLE_MEMORY_PROJECT", os.getcwd())
+DAEMON_PORT = int(os.environ.get("ENSEMBLE_MEMORY_DAEMON_PORT", "9876"))
+
+
+def _notify_daemon_invalidate() -> None:
+    """Fire-and-forget POST /invalidate_cache so daemon reloads memories."""
+    try:
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{DAEMON_PORT}/invalidate_cache",
+            data=b"{}",
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=0.2)
+    except Exception:
+        pass  # Daemon may not be running — that's fine
 
 
 def _store_to_sqlite(memories: list[dict], session_id: str) -> tuple[int, list[str]]:
@@ -133,6 +149,8 @@ def main() -> None:
             f"[store_memory] Stored {len(memories)} memories ({', '.join(parts)})",
             file=sys.stderr,
         )
+        # Notify daemon so it reloads its memory cache on next /search
+        _notify_daemon_invalidate()
 
     # ── Markdown write (always runs) ──────────────────────────────────────────
     # Delegate to write_log.main() by temporarily patching sys.argv so it sees

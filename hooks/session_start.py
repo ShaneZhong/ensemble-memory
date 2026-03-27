@@ -14,6 +14,7 @@ Outputs JSON to stdout:
 import json
 import os
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -106,7 +107,7 @@ def main() -> None:
         # Record the session start even if no memories were loaded
         if session_id:
             try:
-                db.record_session(session_id=session_id, project=project)
+                db.record_session(session_id, time.time())
             except Exception:
                 pass
         print("{}")
@@ -115,7 +116,7 @@ def main() -> None:
     # Record session start in DB
     if session_id:
         try:
-            db.record_session(session_id=session_id, project=project)
+            db.record_session(session_id, time.time())
         except Exception:
             pass
 

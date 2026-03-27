@@ -669,7 +669,7 @@ class TestEmbeddings(unittest.TestCase):
 
 @unittest.skipUnless(HAS_EMBEDDINGS, "sentence-transformers not installed")
 class TestQueryRetrieval(TempDirMixin, unittest.TestCase):
-    """Test UserPromptSubmit query-time memory retrieval."""
+    """Test query-time memory retrieval logic (tests embedding + db directly, not daemon)."""
 
     def _store_with_embedding(self, content, mem_type="correction", importance=8):
         """Helper: insert a memory and generate its embedding."""
@@ -683,14 +683,11 @@ class TestQueryRetrieval(TempDirMixin, unittest.TestCase):
         """Query about databases should retrieve database-related memory."""
         self._store_with_embedding("Always use PostgreSQL, never MySQL")
 
-        import user_prompt_submit as ups
-        ups._memories_cache = None  # Clear cache
-        conn = db.get_db()
-        memories = ups._load_memories(conn, "/test")
+        memories = db.get_memories_with_embeddings(project="/test")
         self.assertTrue(len(memories) > 0)
 
         query_emb = emb.get_embedding("which database should I use")
-        results = emb.find_similar(query_emb, [m for m in memories if m.get("embedding")], threshold=0.2, top_k=5)
+        results = emb.find_similar(query_emb, memories, threshold=0.2, top_k=5)
         contents = [r["content"] for r in results]
         self.assertTrue(any("PostgreSQL" in c for c in contents))
 
@@ -698,14 +695,9 @@ class TestQueryRetrieval(TempDirMixin, unittest.TestCase):
         """Query about weather should not retrieve database memory."""
         self._store_with_embedding("Always use PostgreSQL, never MySQL")
 
-        conn = db.get_db()
-        import user_prompt_submit as ups
-        ups._memories_cache = None
-        memories = ups._load_memories(conn, "/test")
-
+        memories = db.get_memories_with_embeddings(project="/test")
         query_emb = emb.get_embedding("what is the weather forecast")
-        results = emb.find_similar(query_emb, [m for m in memories if m.get("embedding")], threshold=0.2, top_k=5)
-        # Should be empty or very low similarity
+        results = emb.find_similar(query_emb, memories, threshold=0.2, top_k=5)
         pg_results = [r for r in results if "PostgreSQL" in r.get("content", "")]
         self.assertEqual(len(pg_results), 0)
 
@@ -714,23 +706,16 @@ class TestQueryRetrieval(TempDirMixin, unittest.TestCase):
         self._store_with_embedding("Use PostgreSQL not MySQL")
         self._store_with_embedding("SQLite is better for small projects")
 
-        conn = db.get_db()
-        import user_prompt_submit as ups
-        ups._memories_cache = None
-        memories = ups._load_memories(conn, "/test")
-
+        memories = db.get_memories_with_embeddings(project="/test")
         query_emb = emb.get_embedding("set up a database for the project")
-        results = emb.find_similar(query_emb, [m for m in memories if m.get("embedding")], threshold=0.15, top_k=5)
+        results = emb.find_similar(query_emb, memories, threshold=0.15, top_k=5)
         self.assertGreaterEqual(len(results), 1)
 
     def test_memories_without_embeddings_excluded(self):
         """Memories without embeddings should not appear in similarity search."""
-        # Insert without embedding
         db.insert_memory({"type": "correction", "content": "no embedding memory", "importance": 8}, "s1", "/test")
-
-        conn = db.get_db()
         rows = db.get_memories_with_embeddings(project="/test")
-        self.assertEqual(len(rows), 0)  # No embeddings stored
+        self.assertEqual(len(rows), 0)
 
     def test_embedding_stored_on_insert(self):
         """store_memory should generate and store embeddings."""
