@@ -1,14 +1,14 @@
 # Ensemble Memory System — Test Results & Known Issues
 
 **Date**: 2026-03-28 (updated from 2026-03-25)
-**Phase**: Phase 2 Complete (Semantic Search + Embedding Daemon)
+**Phase**: Phase 3 Complete (Knowledge Graph)
 **Test Environment**: Mac Mini M4 16GB, Claude Code v2.1.81, Ollama qwen2.5:3b, sentence-transformers all-MiniLM-L6-v2
 
 ---
 
 ## Test Results
 
-### Automated Tests (62/62 PASS)
+### Automated Tests (96/96 PASS)
 
 Run: `cd ai_memory/ensemble-memory && python3 tests/test_ensemble_memory.py`
 
@@ -16,12 +16,14 @@ Run: `cd ai_memory/ensemble-memory && python3 tests/test_ensemble_memory.py`
 |-----------|-------|--------|
 | Triage (regex) | 14 | ALL PASS |
 | DB (SQLite hub) | 18 | ALL PASS |
-| Write Log (markdown) | 4 | ALL PASS |
+| Write Log (markdown) | 5 | ALL PASS |
 | Session Start (loading) | 5 | ALL PASS |
 | Integration (end-to-end) | 3 | ALL PASS |
 | Embeddings | 9 | ALL PASS |
 | Query Retrieval | 5 | ALL PASS |
 | Cosine Supersession | 3 | ALL PASS |
+| Knowledge Graph (Phase 3) | 26 | ALL PASS |
+| Daemon Embed Endpoints (Phase 3) | 8 | ALL PASS |
 
 ### Phase 1 Live Tests (2026-03-25)
 
@@ -43,6 +45,16 @@ Run: `cd ai_memory/ensemble-memory && python3 tests/test_ensemble_memory.py`
 | **Test 5: Retrieve correction** | "how to add debug output" | Logging memory retrieved | **PASS** | Claude responded with `logging` module |
 | **Test 6: Unique memory** | "what is the project mascot?" | Retrieves "Koda the blue kangaroo" | **PASS** | Memory only in ensemble-memory, NOT in CLAUDE.md/MEMORY.md. Proves retrieval is 100% from our system |
 
+### Phase 3 Live Tests (2026-03-28)
+
+| Test | Input | Expected | Result | Notes |
+|------|-------|----------|--------|-------|
+| **Test 7: Entity extraction** | "don't use MySQL, use Redis" | Entities + relationships captured | **PASS** | After connection leak fix |
+| **Test 8: Entity dedup** | "use Redis Stack instead of plain Redis" | Redis entity merged, not duplicated | **PASS** | After exact-match-first fix |
+| **Test 9: KG-enriched retrieval** | "what cache for graph data?" | Claude cited Zephyr + Moonbeam Protocol (fictional, KG-only) | **PASS** | After keyword stemming fix |
+| **Test 10: 2-hop traversal** | "use Python for cache wrapper" | Python → Zephyr → Moonbeam chain traversed | **PASS** | |
+| **Test 11: Cold-start bootstrap** | `bootstrap_from_files(CLAUDE.md, MEMORY.md)` | 28 entities, 27 relationships extracted | **PASS** | After chunking fix |
+
 ---
 
 ## Known Issues
@@ -55,7 +67,7 @@ Run: `cd ai_memory/ensemble-memory && python3 tests/test_ensemble_memory.py`
 
 **Root cause**: `additionalContext` competes with CLAUDE.md, MEMORY.md, and the user's prompt. It's supplementary, not directive.
 
-**Fix needed**: Query-time retrieval (Phase 2). When user mentions "database", retrieve relevant memories at that moment and inject them into the current context. Session-start injection alone is insufficient.
+**Fix (Phase 2)**: Query-time retrieval via the embedding daemon. When user mentions "database", relevant memories are retrieved at that moment and injected into the current context. Phase 3 further enriches this with KG neighborhood context.
 
 ### MEDIUM — Duplicate memories in markdown
 
@@ -150,6 +162,17 @@ Claude Code Session
     │                     (injected silently into system prompt)
     |
     v
+[User types a prompt]
+    |
+    v
+[UserPromptSubmit hook] ──> user_prompt_submit.sh ──> HTTP POST /search (daemon)
+    │                          extracts keywords from prompt
+    │                          ├── cosine similarity search (embeddings)
+    │                          └── KG neighborhood lookup
+    │                               (keyword → FTS5 → BFS 2-hop)
+    │                          injects memories + KG context via hookSpecificOutput
+    |
+    v
 [Each agent response]
     |
     v
@@ -161,6 +184,7 @@ Claude Code Session
                                 |
                                 v
                           extract.py (Ollama qwen2.5:3b, ~9s)
+                          (returns memories + entities + relationships)
                                 |
                                 v
                           store_memory.py
@@ -169,6 +193,9 @@ Claude Code Session
                             │   ├── temporal metadata
                             │   ├── supersession detection
                             │   └── reinforcement tracking
+                            ├── KG upsert (kg.py)
+                            │   ├── entity resolution + dedup
+                            │   └── relationship edge insert
                             └── Markdown write (write_log.py)
                                 ├── daily YYYY-MM-DD.md
                                 └── content dedup
@@ -178,8 +205,6 @@ Claude Code Session
 
 ## Next Steps
 
-1. Clean dirty test data from SQLite (`DELETE FROM memories`)
-2. Fix content sanitizer to strip markdown formatting
-3. Fix sessions table recording
-4. Run Tests B, C, D with clean data
-5. Phase 2: Query-time retrieval (semantic search via Milvus Lite)
+1. Phase 4: Nightly batch processor (async transcript scan for missed turns)
+2. Phase 5: Public skill installer (`/plugin install ensemble-memory`)
+3. Known issues tracked below still apply to Phase 3

@@ -116,6 +116,22 @@ Every hook payload includes:
 
 ---
 
+## Embedding Daemon Endpoints (port 9876)
+
+The daemon is called by `user_prompt_submit.py` and `kg.py`. All endpoints accept/return JSON.
+
+| Endpoint | Method | Request | Response |
+|----------|--------|---------|----------|
+| `/search` | POST | `{"query": "...", "project": "...", "top_k": 5}` | `{"results": [...], "kg_context": "..."}` |
+| `/embed` | POST | `{"text": "..."}` | `{"embedding": [0.1, ...]}` (384-dim) |
+| `/embed_batch` | POST | `{"texts": ["...", "..."]}` | `{"embeddings": [[...], [...]]}` |
+| `/health` | GET | — | `{"status": "ok", "model": "..."}` |
+| `/invalidate_cache` | POST | `{}` | `{"ok": true}` |
+
+**Error codes**: 400 (missing fields), 503 (model not loaded), 200 (success).
+
+---
+
 ## settings.json Hook Registration
 
 ```json

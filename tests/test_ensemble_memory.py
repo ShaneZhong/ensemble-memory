@@ -797,6 +797,509 @@ class TestCosineSupersession(TempDirMixin, unittest.TestCase):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# 9. Knowledge Graph Tests
+# ═══════════════════════════════════════════════════════════════════════════════
+
+import kg  # noqa: E402 — imported here after HOOKS_DIR is on path
+
+
+class TestKnowledgeGraph(TempDirMixin, unittest.TestCase):
+    """Test Knowledge Graph module (Phase 3)."""
+
+    def test_kg_tables_created(self):
+        """All KG tables should exist after get_db()."""
+        conn = db.get_db()
+        tables = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type IN ('table', 'shadow')"
+        ).fetchall()}
+        conn.close()
+        for tbl in [
+            "kg_entities", "kg_relationships", "kg_memory_links",
+            "kg_episodes", "kg_appears_in", "kg_decay_config", "kg_sync_state",
+        ]:
+            self.assertIn(tbl, tables, f"Missing table: {tbl}")
+
+    def test_upsert_entity_new(self):
+        """Inserting a new entity should store it and return a UUID."""
+        eid = kg.upsert_entity("SQLite", "TECHNOLOGY", description="An embedded database")
+        self.assertIsNotNone(eid)
+        self.assertTrue(len(eid) > 10)
+
+        conn = db.get_db()
+        row = conn.execute("SELECT name, type FROM kg_entities WHERE id = ?", (eid,)).fetchone()
+        conn.close()
+        self.assertIsNotNone(row)
+        self.assertEqual(row["name"], "SQLite")
+        self.assertEqual(row["type"], "TECHNOLOGY")
+
+    def test_upsert_entity_existing(self):
+        """Inserting the same entity twice (by name) should merge, not duplicate."""
+        eid1 = kg.upsert_entity("Python", "TECHNOLOGY", description="A programming language")
+        eid2 = kg.upsert_entity("Python", "TECHNOLOGY", description="A scripting language")
+        self.assertEqual(eid1, eid2)
+
+        conn = db.get_db()
+        count = conn.execute(
+            "SELECT COUNT(*) FROM kg_entities WHERE LOWER(name) = 'python'"
+        ).fetchone()[0]
+        conn.close()
+        self.assertEqual(count, 1)
+
+    def test_upsert_entity_alias_merge(self):
+        """Aliases from two upserts should be merged into a union."""
+        eid1 = kg.upsert_entity("PostgreSQL", "TECHNOLOGY", aliases=["pg", "postgres"])
+        eid2 = kg.upsert_entity("PostgreSQL", "TECHNOLOGY", aliases=["pgsql"])
+        self.assertEqual(eid1, eid2)
+
+        conn = db.get_db()
+        row = conn.execute("SELECT aliases FROM kg_entities WHERE id = ?", (eid1,)).fetchone()
+        conn.close()
+        aliases = json.loads(row["aliases"] or "[]")
+        self.assertIn("pg", aliases)
+        self.assertIn("postgres", aliases)
+        self.assertIn("pgsql", aliases)
+
+    def test_upsert_entity_description_update(self):
+        """Longer description should replace a shorter one on merge."""
+        eid1 = kg.upsert_entity("Ollama", "TOOL", description="LLM runner")
+        eid2 = kg.upsert_entity("Ollama", "TOOL", description="Local LLM inference server for running models")
+        self.assertEqual(eid1, eid2)
+
+        conn = db.get_db()
+        row = conn.execute("SELECT description FROM kg_entities WHERE id = ?", (eid1,)).fetchone()
+        conn.close()
+        self.assertIn("inference", row["description"])
+
+    def test_entity_type_stored_as_is(self):
+        """Entity type is stored as provided (no validation at this layer)."""
+        eid = kg.upsert_entity("CustomType", "MY_CUSTOM_TYPE")
+        conn = db.get_db()
+        row = conn.execute("SELECT type FROM kg_entities WHERE id = ?", (eid,)).fetchone()
+        conn.close()
+        self.assertEqual(row["type"], "MY_CUSTOM_TYPE")
+
+    def test_insert_relationship(self):
+        """insert_relationship should store a relationship row and return an id."""
+        rel_id = kg.insert_relationship(
+            subject_name="ensemble-memory",
+            predicate="USES",
+            object_name="SQLite",
+            evidence="The project stores memories in SQLite",
+            confidence=0.9,
+        )
+        self.assertIsNotNone(rel_id)
+
+        conn = db.get_db()
+        row = conn.execute(
+            "SELECT predicate, confidence FROM kg_relationships WHERE id = ?",
+            (rel_id,),
+        ).fetchone()
+        conn.close()
+        self.assertEqual(row["predicate"], "USES")
+        self.assertAlmostEqual(row["confidence"], 0.9, places=2)
+
+    def test_insert_relationship_invalid_predicate(self):
+        """Invalid predicate with no valid parts should fall back to RELATED_TO."""
+        result = kg.insert_relationship(
+            subject_name="A",
+            predicate="INVALID_PRED",
+            object_name="B",
+        )
+        # Fallback to RELATED_TO — should return a valid relationship id
+        self.assertIsNotNone(result)
+
+        conn = db.get_db()
+        # The original invalid predicate should not be stored verbatim
+        count = conn.execute(
+            "SELECT COUNT(*) FROM kg_relationships WHERE predicate = 'INVALID_PRED'"
+        ).fetchone()[0]
+        self.assertEqual(count, 0)
+        # Instead it should be stored as RELATED_TO
+        count_related = conn.execute(
+            "SELECT COUNT(*) FROM kg_relationships WHERE predicate = 'RELATED_TO' "
+            "AND subject_id IN (SELECT id FROM kg_entities WHERE name = 'A') "
+            "AND object_id IN (SELECT id FROM kg_entities WHERE name = 'B')"
+        ).fetchone()[0]
+        conn.close()
+        self.assertEqual(count_related, 1)
+
+    def test_insert_relationship_pipe_predicate_normalization(self):
+        """Pipe-separated predicate like 'CAUSES | AFFECTS' should use first valid part."""
+        result = kg.insert_relationship(
+            subject_name="PipeSubject",
+            predicate="CAUSES | AFFECTS",
+            object_name="PipeObject",
+        )
+        self.assertIsNotNone(result)
+
+        conn = db.get_db()
+        # Should be stored as AFFECTS (first valid part in PREDICATES)
+        row = conn.execute(
+            "SELECT predicate FROM kg_relationships WHERE id = ?", (result,)
+        ).fetchone()
+        conn.close()
+        self.assertEqual(row["predicate"], "AFFECTS")
+
+    def test_insert_memory_pipe_type_normalization(self):
+        """Pipe-separated memory_type like 'correction | semantic' should use first valid part."""
+        mem = {
+            "type": "correction | semantic | procedural",
+            "content": "test pipe type normalization content unique",
+            "importance": 7,
+            "confidence": 1.0,
+        }
+        mem_id = db.insert_memory(mem, "test-session", "/test-project-pipe")
+        self.assertIsNotNone(mem_id)
+
+        conn = db.get_db()
+        row = conn.execute(
+            "SELECT memory_type FROM memories WHERE id = ?", (mem_id,)
+        ).fetchone()
+        conn.close()
+        self.assertEqual(row["memory_type"], "correction")
+
+    def test_insert_relationship_creates_entities(self):
+        """Entities referenced in a relationship should be auto-created."""
+        kg.insert_relationship(
+            subject_name="NewProject",
+            predicate="DEPENDS_ON",
+            object_name="NewLibrary",
+        )
+        conn = db.get_db()
+        proj = conn.execute(
+            "SELECT id FROM kg_entities WHERE LOWER(name) = 'newproject'"
+        ).fetchone()
+        lib = conn.execute(
+            "SELECT id FROM kg_entities WHERE LOWER(name) = 'newlibrary'"
+        ).fetchone()
+        conn.close()
+        self.assertIsNotNone(proj)
+        self.assertIsNotNone(lib)
+
+    def test_insert_relationship_duplicate(self):
+        """Same relationship inserted twice should update confidence, not duplicate."""
+        rel_id1 = kg.insert_relationship("A", "USES", "B", confidence=0.5)
+        rel_id2 = kg.insert_relationship("A", "USES", "B", confidence=0.9)
+        self.assertEqual(rel_id1, rel_id2)
+
+        conn = db.get_db()
+        count = conn.execute(
+            "SELECT COUNT(*) FROM kg_relationships WHERE predicate = 'USES' AND valid_until IS NULL"
+        ).fetchone()[0]
+        row = conn.execute(
+            "SELECT confidence FROM kg_relationships WHERE id = ?", (rel_id1,)
+        ).fetchone()
+        conn.close()
+        self.assertEqual(count, 1)
+        self.assertAlmostEqual(row["confidence"], 0.9, places=2)
+
+    def test_search_entities_fts(self):
+        """FTS5 search should find entities by exact name."""
+        kg.upsert_entity("qwen2.5:3b", "TECHNOLOGY", description="Ollama LLM model")
+        results = kg.search_entities_fts("qwen2.5:3b")
+        names = [r["name"] for r in results]
+        self.assertTrue(any("qwen" in n.lower() for n in names))
+
+    def test_search_entities_fts_partial(self):
+        """Search should find entities by partial name match (LIKE fallback)."""
+        kg.upsert_entity("all-MiniLM-L6-v2", "TECHNOLOGY", description="Embedding model")
+        results = kg.search_entities_fts("MiniLM")
+        self.assertTrue(len(results) > 0)
+
+    def test_search_entities_fts_no_results(self):
+        """Search for unknown entity should return empty list."""
+        results = kg.search_entities_fts("xyzzy_nonexistent_entity_12345")
+        self.assertEqual(results, [])
+
+    def test_kg_entity_neighborhood_empty(self):
+        """Neighborhood of unknown entity name should return empty."""
+        result = kg.kg_entity_neighborhood(["totally_unknown_entity_xyz"])
+        self.assertEqual(result["entities"], [])
+        self.assertEqual(result["relationships"], [])
+
+    def test_kg_entity_neighborhood_depth0(self):
+        """Neighborhood at depth 0 should return only the seed entity."""
+        kg.upsert_entity("SeedEntity", "CONCEPT")
+        result = kg.kg_entity_neighborhood(["SeedEntity"], max_depth=0)
+        names = [e["name"] for e in result["entities"]]
+        self.assertIn("SeedEntity", names)
+
+    def test_kg_entity_neighborhood_depth1(self):
+        """Direct neighbors (depth 1) should be found."""
+        kg.upsert_entity("Hub", "CONCEPT")
+        kg.upsert_entity("Spoke", "CONCEPT")
+        kg.insert_relationship("Hub", "RELATED_TO", "Spoke")
+
+        result = kg.kg_entity_neighborhood(["Hub"], max_depth=1)
+        names = [e["name"] for e in result["entities"]]
+        self.assertIn("Hub", names)
+        self.assertIn("Spoke", names)
+
+    def test_kg_entity_neighborhood_depth2(self):
+        """Two-hop neighbors should be found at max_depth=2."""
+        kg.upsert_entity("A", "CONCEPT")
+        kg.upsert_entity("B", "CONCEPT")
+        kg.upsert_entity("C", "CONCEPT")
+        kg.insert_relationship("A", "RELATED_TO", "B")
+        kg.insert_relationship("B", "RELATED_TO", "C")
+
+        result = kg.kg_entity_neighborhood(["A"], max_depth=2, max_neighbors=10)
+        names = [e["name"] for e in result["entities"]]
+        self.assertIn("A", names)
+        self.assertIn("B", names)
+        self.assertIn("C", names)
+
+    def test_kg_entity_neighborhood_cycle(self):
+        """Cyclic relationships should not cause infinite loops."""
+        kg.upsert_entity("X", "CONCEPT")
+        kg.upsert_entity("Y", "CONCEPT")
+        kg.insert_relationship("X", "RELATED_TO", "Y")
+        kg.insert_relationship("Y", "RELATED_TO", "X")
+
+        # Should complete without error
+        result = kg.kg_entity_neighborhood(["X"], max_depth=5)
+        self.assertIsNotNone(result)
+        names = [e["name"] for e in result["entities"]]
+        self.assertIn("X", names)
+
+    def test_record_episode(self):
+        """record_episode should create an episode and link entities."""
+        ep_id = kg.record_episode(
+            session_id="test-session-kg",
+            content="The user decided to use SQLite for storage",
+            summary="SQLite storage decision",
+            entity_names=["SQLite", "storage"],
+        )
+        self.assertIsNotNone(ep_id)
+
+        conn = db.get_db()
+        ep = conn.execute("SELECT id FROM kg_episodes WHERE id = ?", (ep_id,)).fetchone()
+        self.assertIsNotNone(ep)
+
+        links = conn.execute(
+            "SELECT COUNT(*) FROM kg_appears_in WHERE episode_id = ?", (ep_id,)
+        ).fetchone()[0]
+        conn.close()
+        self.assertGreaterEqual(links, 1)
+
+    def test_get_entity_stats(self):
+        """get_entity_stats should return correct counts."""
+        kg.upsert_entity("StatsEntityA", "CONCEPT")
+        kg.upsert_entity("StatsEntityB", "CONCEPT")
+        kg.insert_relationship("StatsEntityA", "RELATED_TO", "StatsEntityB")
+
+        stats = kg.get_entity_stats()
+        self.assertGreaterEqual(stats["total_entities"], 2)
+        self.assertGreaterEqual(stats["total_relationships"], 1)
+        self.assertIn("total_episodes", stats)
+        self.assertIn("total_links", stats)
+
+    def test_bootstrap_prompt_structure(self):
+        """bootstrap_from_files should call Ollama and process results (mocked)."""
+        import unittest.mock as mock
+
+        mock_response = json.dumps({
+            "entities": [
+                {"name": "MockEntity", "type": "CONCEPT", "description": "A test entity"},
+            ],
+            "relationships": [],
+        })
+        ollama_response = json.dumps({"response": mock_response})
+
+        # Write a temp file to bootstrap from
+        test_file = os.path.join(self.tmpdir, "CLAUDE.md")
+        with open(test_file, "w") as f:
+            f.write("# Test\n\nUse Python 3.11.\n")
+
+        class FakeResp:
+            def read(self):
+                return ollama_response.encode()
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                pass
+
+        with mock.patch("urllib.request.urlopen", return_value=FakeResp()):
+            stats = kg.bootstrap_from_files([test_file])
+
+        self.assertGreaterEqual(stats["entities_created"], 1)
+        self.assertIn("relationships_created", stats)
+
+    def test_extraction_prompt_entities(self):
+        """Updated extraction prompt should contain 'entities' field."""
+        from pathlib import Path as P
+        prompt_path = P(__file__).parent.parent / "hooks" / "prompts" / "extraction.txt"
+        content = prompt_path.read_text(encoding="utf-8")
+        self.assertIn('"entities"', content)
+        self.assertIn('"relationships"', content)
+
+    def test_validate_extraction_with_entities(self):
+        """validate_extraction should accept the new entities+relationships format."""
+        import extract
+        data = {
+            "memories": [],
+            "entities": [{"name": "SQLite", "type": "TECHNOLOGY"}],
+            "relationships": [{"subject": "A", "predicate": "USES", "object": "B"}],
+            "summary": [],
+        }
+        self.assertTrue(extract.validate_extraction(data))
+
+    def test_validate_extraction_backward_compatible(self):
+        """validate_extraction should still accept old format (no entities/relationships)."""
+        import extract
+        old_format = {
+            "memories": [{"type": "correction", "content": "test", "importance": 7}],
+            "summary": ["test session"],
+        }
+        self.assertTrue(extract.validate_extraction(old_format))
+
+        invalid = {"memories": "not a list", "summary": []}
+        self.assertFalse(extract.validate_extraction(invalid))
+
+        invalid2 = {"memories": [], "summary": "not a list"}
+        self.assertFalse(extract.validate_extraction(invalid2))
+
+        invalid3 = {"memories": [], "summary": [], "entities": "not a list"}
+        self.assertFalse(extract.validate_extraction(invalid3))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 10. Daemon /embed endpoint Tests
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestDaemonEmbedEndpoint(unittest.TestCase):
+    """Test /embed and /embed_batch endpoints in the daemon handler."""
+
+    def setUp(self):
+        """Set up a minimal handler instance with a mocked model."""
+        import sys
+        daemon_dir = Path(__file__).parent.parent / "daemon"
+        sys.path.insert(0, str(daemon_dir))
+
+        import embedding_daemon as daemon_module
+        self.daemon = daemon_module
+
+        # Install a fake model so _get_embedding returns a predictable vector
+        class FakeModel:
+            def encode(self, text, normalize_embeddings=False):
+                import numpy as np
+                # Return deterministic 384-dim vector based on text length
+                vec = [float(len(text) % 10) / 10.0] * 384
+                return type("arr", (), {"tolist": lambda self: vec})()
+
+        self._orig_model = daemon_module._model
+        self._orig_has_embeddings = daemon_module._has_embeddings
+        daemon_module._model = FakeModel()
+        daemon_module._has_embeddings = True
+
+    def tearDown(self):
+        import sys
+        daemon_dir = Path(__file__).parent.parent / "daemon"
+        if str(daemon_dir) in sys.path:
+            sys.path.remove(str(daemon_dir))
+        self.daemon._model = self._orig_model
+        self.daemon._has_embeddings = self._orig_has_embeddings
+
+    def _make_request(self, path, body_dict):
+        """Simulate a POST request through the handler's do_POST, return (code, body)."""
+        import io
+        import json as _json
+        from http.server import BaseHTTPRequestHandler
+
+        raw_body = _json.dumps(body_dict).encode()
+        daemon = self.daemon
+
+        captured = {}
+
+        class FakeHandler(daemon._Handler):
+            def __init__(self):
+                # Skip BaseHTTPRequestHandler.__init__ — we mock everything
+                self.path = path
+                self.headers = {"Content-Length": str(len(raw_body))}
+                self.rfile = io.BytesIO(raw_body)
+                self._response_code = None
+                self._response_body = None
+
+            def send_response(self, code):
+                self._response_code = code
+
+            def send_header(self, key, val):
+                pass
+
+            def end_headers(self):
+                pass
+
+            @property
+            def wfile(self):
+                return io.BytesIO()
+
+            def _send_json(self, code, body):
+                captured["code"] = code
+                captured["body"] = body
+
+        h = FakeHandler()
+        h.do_POST()
+        return captured.get("code"), captured.get("body")
+
+    def test_embed_returns_embedding(self):
+        """POST /embed with valid text should return a 384-dim embedding."""
+        code, body = self._make_request("/embed", {"text": "hello world"})
+        self.assertEqual(code, 200)
+        self.assertIn("embedding", body)
+        self.assertEqual(len(body["embedding"]), 384)
+
+    def test_embed_all_floats(self):
+        """Embedding values should be floats."""
+        code, body = self._make_request("/embed", {"text": "test"})
+        self.assertEqual(code, 200)
+        for val in body["embedding"]:
+            self.assertIsInstance(val, float)
+
+    def test_embed_missing_text_returns_400(self):
+        """POST /embed without 'text' field should return 400."""
+        code, body = self._make_request("/embed", {})
+        self.assertEqual(code, 400)
+        self.assertIn("error", body)
+
+    def test_embed_batch_returns_embeddings(self):
+        """POST /embed_batch with valid texts should return list of embeddings."""
+        code, body = self._make_request("/embed_batch", {"texts": ["hello", "world", "test"]})
+        self.assertEqual(code, 200)
+        self.assertIn("embeddings", body)
+        self.assertEqual(len(body["embeddings"]), 3)
+        for emb in body["embeddings"]:
+            self.assertEqual(len(emb), 384)
+
+    def test_embed_batch_missing_texts_returns_400(self):
+        """POST /embed_batch without 'texts' field should return 400."""
+        code, body = self._make_request("/embed_batch", {})
+        self.assertEqual(code, 400)
+        self.assertIn("error", body)
+
+    def test_embed_batch_empty_list_returns_400(self):
+        """POST /embed_batch with empty list should return 400."""
+        code, body = self._make_request("/embed_batch", {"texts": []})
+        self.assertEqual(code, 400)
+        self.assertIn("error", body)
+
+    def test_embed_model_unavailable_returns_503(self):
+        """POST /embed when model is None should return 503."""
+        self.daemon._model = None
+        self.daemon._has_embeddings = False
+        code, body = self._make_request("/embed", {"text": "hello"})
+        self.assertEqual(code, 503)
+        self.assertIn("error", body)
+
+    def test_embed_batch_model_unavailable_returns_503(self):
+        """POST /embed_batch when model is None should return 503."""
+        self.daemon._model = None
+        self.daemon._has_embeddings = False
+        code, body = self._make_request("/embed_batch", {"texts": ["hello"]})
+        self.assertEqual(code, 503)
+        self.assertIn("error", body)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Runner
 # ═══════════════════════════════════════════════════════════════════════════════
 

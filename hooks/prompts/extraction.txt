@@ -7,7 +7,7 @@ conversation turn and extract important memories. Output ONLY valid JSON.
 ## Conversation Turn
 {conversation_turn}
 
-## Extract memories matching this schema:
+## Extract memories, entities, and relationships matching this schema:
 {
   "memories": [
     {
@@ -15,9 +15,28 @@ conversation turn and extract important memories. Output ONLY valid JSON.
       "content": "natural language description",
       "importance": 1-10 (corrections: min 7, decisions: min 6, facts: min 5),
       "confidence": 0.0-1.0 (1.0 = explicit user statement),
+      "subject": "entity or concept this is about (e.g. 'database', 'Python version')",
+      "predicate": "relationship (e.g. 'should_use', 'must_not_use')",
+      "object": "target value (e.g. 'SQLite', '3.11')",
       "rule": "for procedural: imperative rule statement, else null",
       "what_went_wrong": "for corrections: what went wrong, else null",
       "how_it_was_resolved": "for corrections: how it was fixed, else null"
+    }
+  ],
+  "entities": [
+    {
+      "name": "entity name (e.g. 'SQLite', 'Ollama', 'ensemble-memory')",
+      "type": "TECHNOLOGY | PROJECT | TOOL | FILE | API | PERSON | PREFERENCE | ERROR | CONCEPT | ORGANIZATION | RULE | DECISION",
+      "description": "brief description of this entity in context"
+    }
+  ],
+  "relationships": [
+    {
+      "subject": "source entity name",
+      "predicate": "USES | DEPENDS_ON | CONFLICTS_WITH | HAS_CONSTRAINT | HAS_VERSION | RUNS_ON | APPLIES_TO | PREVENTS | SUPERSEDES | CAUSED_BY | IMPLEMENTED_IN | STORED_IN | PART_OF | AFFECTS | RELATED_TO | WORKS_ON",
+      "object": "target entity name",
+      "evidence": "brief quote or reason from conversation",
+      "confidence": 0.0-1.0
     }
   ],
   "summary": ["third person, past tense bullet summaries"]
@@ -26,4 +45,6 @@ conversation turn and extract important memories. Output ONLY valid JSON.
 RULES:
 - Every memory MUST cite evidence from the conversation. Do not invent.
 - For corrections: extract BOTH the correction AND the derived rule.
-- If nothing is memory-worthy, return {"memories": [], "summary": []}.
+- Extract entities: technologies, tools, files, projects, APIs, people mentioned.
+- Extract relationships between entities when explicitly stated or strongly implied.
+- If nothing is memory-worthy, return {"memories": [], "entities": [], "relationships": [], "summary": []}.

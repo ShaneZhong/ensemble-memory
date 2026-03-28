@@ -16,6 +16,11 @@ Claude Code session
     v
 [UserPromptSubmit hook] ──> Query daemon ──> Find similar memories ──> Inject relevant ones
     |                        (~50ms)          (cosine similarity)       via hookSpecificOutput
+    |                                              |
+    |                                              v
+    |                                   [KG neighborhood lookup]
+    |                                   (keyword → FTS5 → BFS 2-hop)
+    |                                   [Inject entity/relationship context]
     v
 [Claude responds]
     |
@@ -26,9 +31,12 @@ Claude Code session
                                               |
                                               v
                                       [Ollama qwen2.5:3b ~9s]
+                                      (extracts memories +
+                                       entities + relationships)
                                               |
                                               v
                                    [SQLite + Markdown write]
+                                   [KG entity/relationship upsert]
                                               |
                                               v
                                    [Daemon /embed + /invalidate_cache]
@@ -45,6 +53,8 @@ Claude Code session
 - Corrections: "no, don't use MySQL, use PostgreSQL"
 - Decisions: "let's use SQLite for the database"
 - Procedural rules: derived patterns from repeated corrections
+- Entities: named technologies, tools, projects, people, rules extracted from each turn
+- Relationships: typed edges between entities (e.g. `Python USES SQLite`, `Redis CONFLICTS_WITH MySQL`)
 
 ## What Doesn't Get Captured
 
@@ -139,6 +149,18 @@ All settings via environment variables or `~/.ensemble_memory/config.toml`:
 - **UserPromptSubmit**: semantic query-time retrieval — embeds the user's prompt, finds similar memories via cosine similarity, injects only relevant ones as context BEFORE Claude responds
 - Temporal decay scoring (ACT-R Petrov + Ebbinghaus forgetting curve) weights fresher memories higher
 
+### Knowledge Graph
+- **Entity extraction**: entities (name, type, description) extracted from each turn alongside memories
+- **Entity dedup**: exact name match first, then FTS5 fuzzy lookup, then cosine similarity (> 0.85) to merge similar entities
+- **Relationship edges**: typed predicates (USES, DEPENDS_ON, CONFLICTS_WITH, ...) with confidence scores
+- **Predicate normalization**: LLM output like `"CAUSES | AFFECTS"` normalized to first valid predicate
+- **2-hop BFS traversal**: bidirectional BFS via recursive SQLite CTE with cycle detection
+- **FTS5 index**: full-text search on entity names, aliases, and descriptions
+- **KG-enriched retrieval**: `/search` daemon endpoint extracts keywords, queries FTS5, runs BFS neighborhood, injects entity+relationship context alongside semantic memories
+- **Cold-start bootstrap**: `bootstrap_from_files()` processes CLAUDE.md and MEMORY.md in 2000-char chunks, populating the KG from existing project docs
+- **Decay config**: per-predicate decay windows (e.g. `HAS_VERSION` = 30 days, `APPLIES_TO` = permanent)
+- **Episode tracking**: `kg_episodes` table records session turns; `kg_appears_in` links entities to episodes
+
 ### Supersession
 - **Structured**: same subject + predicate → old fact automatically superseded
 - **Cosine similarity** (>= 0.85): semantically similar corrections auto-supersede (Phase 2)
@@ -171,20 +193,28 @@ Full design: [final_design.md](../synthesis/final_design.md) (1,931 lines)
 ensemble-memory/
 ├── daemon/
 │   ├── embedding_daemon.py    # Persistent HTTP server (port 9876, ~200MB RAM)
+│   │                          #   endpoints: /search, /embed, /embed_batch,
+│   │                          #   /invalidate_cache, /health
 │   └── daemon_ctl.sh          # start/stop/restart/status management
 ├── hooks/
-│   ├── db.py                  # SQLite hub (schema, temporal scoring, supersession)
+│   ├── db.py                  # SQLite hub (schema, temporal scoring, supersession,
+│   │                          #   KG tables: kg_entities, kg_relationships,
+│   │                          #   kg_memory_links, kg_episodes, kg_appears_in,
+│   │                          #   kg_decay_config, kg_sync_state + FTS5 virtual table)
+│   ├── kg.py                  # Knowledge graph module (entity resolution, relationship
+│   │                          #   edges, 2-hop BFS traversal, cold-start bootstrap)
 │   ├── embeddings.py          # Sentence-transformers wrapper (all-MiniLM-L6-v2, 384-dim)
 │   ├── triage.py              # Regex signal detection (< 5ms)
 │   ├── extract.py             # Ollama qwen2.5:3b caller with JSON validation + retry
+│   │                          #   (returns memories + entities + relationships)
 │   ├── write_log.py           # Markdown daily log writer with dedup
 │   ├── store_memory.py        # SQLite + embedding + markdown orchestrator
 │   ├── session_start.sh/py    # SessionStart hook — load standing rules
 │   ├── stop.sh                # Stop hook — capture corrections + decisions
 │   ├── user_prompt_submit.sh/py  # UserPromptSubmit hook — thin HTTP client to daemon
-│   └── prompts/extraction.txt # LLM prompt template
+│   └── prompts/extraction.txt # LLM prompt template (memories + entities + relationships)
 ├── tests/
-│   └── test_ensemble_memory.py  # 62 tests (Phase 1 + Phase 2)
+│   └── test_ensemble_memory.py  # 96 tests (62 Phase 1/2 + 34 Phase 3)
 ├── config/default_config.toml
 ├── install.sh
 ├── HOOKS_REFERENCE.md         # Critical: hook payload/response format docs
@@ -198,15 +228,17 @@ ensemble-memory/
 python3 tests/test_ensemble_memory.py
 ```
 
-62 tests covering:
+96 tests covering:
 - Triage: 14 tests (all regex patterns, false positive rejection, case sensitivity, user-only scanning)
 - DB: 18 tests (CRUD, temporal scoring, supersession, dedup, reinforcement, confidence fields)
-- Write Log: 4 tests (file creation, format, dedup)
+- Write Log: 5 tests (file creation, format, dedup, empty memories)
 - Session Start: 5 tests (loading, filtering, grouping, format)
 - Integration: 3 tests (store + load roundtrip, supersession, full pipeline)
 - Embeddings: 9 tests (generation, dimension, similarity, batch, find_similar)
 - Query Retrieval: 5 tests (relevant/irrelevant queries, multiple results, embedding storage)
 - Cosine Supersession: 3 tests (similar supersedes, unrelated doesn't, Jaccard fallback)
+- Knowledge Graph: 26 tests (entity upsert/dedup/merge, relationship CRUD, predicate normalization, BFS traversal, FTS5 search, episode recording, bootstrap, extraction prompt format)
+- Daemon Embed Endpoints: 8 tests (/embed and /embed_batch happy path, error cases, model-unavailable 503)
 
 ## Roadmap
 
@@ -216,7 +248,7 @@ python3 tests/test_ensemble_memory.py
 - [x] Phase 2: Query-time retrieval (UserPromptSubmit hook via embedding daemon)
 - [x] Phase 2: Cosine supersession (replaces Jaccard for embedded memories)
 - [x] Phase 2: Persistent embedding daemon (port 9876, auto-start, 30min idle shutdown)
-- [ ] Phase 3: Knowledge graph (SQLite adjacency tables, entity extraction)
+- [x] Phase 3: Knowledge graph (SQLite adjacency tables, entity extraction, BFS retrieval, cold-start bootstrap)
 - [ ] Phase 4: Nightly batch processor (async transcript scan)
 - [ ] Phase 5: Public skill installer (`/plugin install ensemble-memory`)
 

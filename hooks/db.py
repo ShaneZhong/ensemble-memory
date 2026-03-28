@@ -151,15 +151,147 @@ INSERT OR IGNORE INTO supersession_depth_limits VALUES
     ('correction', 2, 'Error resolution chains pruned aggressively'),
     ('semantic',   3, 'Fact chains pruned at depth 3'),
     ('episodic',   5, 'Preference chains allowed longer history');
+
+-- Knowledge Graph tables
+CREATE TABLE IF NOT EXISTS kg_entities (
+    id                  TEXT PRIMARY KEY,
+    name                TEXT NOT NULL,
+    type                TEXT NOT NULL,
+    subtype             TEXT,
+    description         TEXT,
+    aliases             TEXT,           -- JSON array
+    first_seen          REAL NOT NULL,
+    last_updated        REAL NOT NULL,
+    last_accessed       REAL,
+    access_count        INTEGER DEFAULT 0,
+    session_count       INTEGER DEFAULT 0,
+    weight              REAL DEFAULT 0.5,
+    community_id        INTEGER,
+    temporal_memory_id  TEXT,
+    FOREIGN KEY (temporal_memory_id) REFERENCES memories(id)
+);
+CREATE INDEX IF NOT EXISTS idx_kg_entity_name ON kg_entities(name);
+CREATE INDEX IF NOT EXISTS idx_kg_entity_type ON kg_entities(type);
+CREATE INDEX IF NOT EXISTS idx_kg_entity_community ON kg_entities(community_id);
+
+CREATE TABLE IF NOT EXISTS kg_relationships (
+    id                  TEXT PRIMARY KEY,
+    subject_id          TEXT NOT NULL,
+    predicate           TEXT NOT NULL
+                        CHECK(predicate IN ('USES','DEPENDS_ON','CONFLICTS_WITH',
+                              'HAS_CONSTRAINT','HAS_VERSION','RUNS_ON',
+                              'APPLIES_TO','PREVENTS','SUPERSEDES','CAUSED_BY',
+                              'IMPLEMENTED_IN','STORED_IN','PART_OF','AFFECTS',
+                              'RELATED_TO','WORKS_ON')),
+    object_id           TEXT NOT NULL,
+    evidence            TEXT,
+    confidence          REAL DEFAULT 0.5,
+    valid_from          REAL,
+    valid_until         REAL,
+    episode_id          TEXT,
+    temporal_memory_id  TEXT,
+    synced_to_temporal  INTEGER DEFAULT 0,
+    created_at          REAL NOT NULL,
+    FOREIGN KEY (subject_id) REFERENCES kg_entities(id),
+    FOREIGN KEY (object_id) REFERENCES kg_entities(id),
+    FOREIGN KEY (temporal_memory_id) REFERENCES memories(id)
+);
+CREATE INDEX IF NOT EXISTS idx_kg_rel_subject ON kg_relationships(subject_id, valid_until);
+CREATE INDEX IF NOT EXISTS idx_kg_rel_object ON kg_relationships(object_id, valid_until);
+CREATE INDEX IF NOT EXISTS idx_kg_rel_predicate ON kg_relationships(predicate);
+CREATE INDEX IF NOT EXISTS idx_kg_rel_valid ON kg_relationships(valid_from, valid_until);
+CREATE INDEX IF NOT EXISTS idx_kg_rel_sync ON kg_relationships(synced_to_temporal)
+    WHERE synced_to_temporal = 0;
+
+CREATE TABLE IF NOT EXISTS kg_memory_links (
+    id                  TEXT PRIMARY KEY,
+    source_entity_id    TEXT NOT NULL,
+    target_entity_id    TEXT NOT NULL,
+    link_type           TEXT NOT NULL
+                        CHECK(link_type IN ('RELATED','CONTRADICTS','SUPERSEDES',
+                              'EVOLVED_FROM','SUPPORTS','REFINES','ENABLES',
+                              'CAUSED_BY')),
+    strength            REAL DEFAULT 0.5,
+    created_at          REAL NOT NULL,
+    FOREIGN KEY (source_entity_id) REFERENCES kg_entities(id),
+    FOREIGN KEY (target_entity_id) REFERENCES kg_entities(id)
+);
+CREATE INDEX IF NOT EXISTS idx_kg_memlink_source ON kg_memory_links(source_entity_id);
+CREATE INDEX IF NOT EXISTS idx_kg_memlink_target ON kg_memory_links(target_entity_id);
+
+CREATE TABLE IF NOT EXISTS kg_episodes (
+    id                  TEXT PRIMARY KEY,
+    session_id          TEXT NOT NULL,
+    session_timestamp   REAL NOT NULL,
+    event_time          REAL,
+    content             TEXT,
+    summary             TEXT
+);
+
+CREATE TABLE IF NOT EXISTS kg_appears_in (
+    entity_id   TEXT NOT NULL,
+    episode_id  TEXT NOT NULL,
+    role        TEXT DEFAULT 'context',
+    PRIMARY KEY (entity_id, episode_id),
+    FOREIGN KEY (entity_id) REFERENCES kg_entities(id),
+    FOREIGN KEY (episode_id) REFERENCES kg_episodes(id)
+);
+CREATE INDEX IF NOT EXISTS idx_kg_appears_entity ON kg_appears_in(entity_id);
+
+CREATE TABLE IF NOT EXISTS kg_decay_config (
+    predicate       TEXT PRIMARY KEY,
+    decay_window_days INTEGER,
+    description     TEXT
+);
+
+INSERT OR IGNORE INTO kg_decay_config VALUES
+    ('HAS_VERSION',    30,   'Version info ages quickly'),
+    ('USES',           180,  'Tech choices evolve slowly'),
+    ('DEPENDS_ON',     180,  'Dependencies change slowly'),
+    ('CONFLICTS_WITH', 90,   'Conflicts may be resolved'),
+    ('HAS_CONSTRAINT', 180,  'Constraints are fairly stable'),
+    ('RUNS_ON',        180,  'Runtime environment changes slowly'),
+    ('APPLIES_TO',     NULL, 'Rules are permanent until superseded'),
+    ('PREVENTS',       NULL, 'Prevention rules are permanent'),
+    ('SUPERSEDES',     NULL, 'Supersession is a permanent record'),
+    ('CAUSED_BY',      180,  'Causal links age with context'),
+    ('IMPLEMENTED_IN', 180,  'Implementation details evolve'),
+    ('STORED_IN',      180,  'Storage locations change'),
+    ('PART_OF',        NULL, 'Structural relationships are stable'),
+    ('AFFECTS',        90,   'Effect relationships may change'),
+    ('RELATED_TO',     180,  'General relationships age'),
+    ('WORKS_ON',       90,   'Work assignments change');
+
+CREATE TABLE IF NOT EXISTS kg_sync_state (
+    key         TEXT PRIMARY KEY,
+    value       TEXT NOT NULL,
+    updated_at  REAL NOT NULL
+);
+INSERT OR IGNORE INTO kg_sync_state VALUES
+    ('last_claude_md_sync', '0', 0),
+    ('last_memory_md_sync', '0', 0);
 """
 
 # ── Connection ─────────────────────────────────────────────────────────────────
+
+_KG_FTS_DDL = """
+CREATE VIRTUAL TABLE IF NOT EXISTS kg_entities_fts USING fts5(
+    name, aliases, description,
+    content='kg_entities', content_rowid='rowid'
+);
+"""
+
 
 def get_db() -> sqlite3.Connection:
     """Return a WAL-mode SQLite connection, creating tables on first run."""
     conn = sqlite3.connect(str(_db_path()), check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.executescript(_DDL)
+    # FTS5 virtual table — wrapped in try/except for safety
+    try:
+        conn.executescript(_KG_FTS_DDL)
+    except sqlite3.OperationalError:
+        pass  # FTS5 not available or already exists
     conn.commit()
     return conn
 
@@ -293,7 +425,18 @@ def insert_memory(memory_dict: dict, session_id: str, project: str) -> str:
     now = time.time()
 
     content = memory_dict.get("content", "").strip()
-    memory_type = memory_dict.get("memory_type") or memory_dict.get("type", "episodic")
+    raw_type = memory_dict.get("memory_type") or memory_dict.get("type", "episodic")
+
+    # Normalize memory_type: LLMs sometimes return "correction | semantic | procedural".
+    # Split on '|' and ',' and pick the first token that is a valid memory_type.
+    _VALID_MEMORY_TYPES = frozenset(["episodic", "semantic", "procedural", "correction"])
+    memory_type = "episodic"  # fallback default
+    for _part in (raw_type or "").replace(",", "|").split("|"):
+        _candidate = _part.strip().lower()
+        if _candidate in _VALID_MEMORY_TYPES:
+            memory_type = _candidate
+            break
+
     importance = int(memory_dict.get("importance", 5))
     content_hash = _content_hash(content)
 
@@ -312,56 +455,58 @@ def insert_memory(memory_dict: dict, session_id: str, project: str) -> str:
     stability = float(memory_dict.get("stability", _compute_stability(importance)))
     gc_protected = 1 if importance >= 9 else 0
 
-    conn.execute(
-        """
-        INSERT INTO memories (
-            id, content, content_hash, memory_type, importance,
-            extraction_confidence, confidence,
-            subject, predicate, object,
-            session_id, source_expert, project,
-            created_at, event_time, valid_from, valid_to,
-            last_accessed_at, access_count,
-            superseded_by, superseded_at,
-            decay_rate, stability, temporal_confidence,
-            reinforcement_count, promotion_candidate,
-            temporal_score, score_computed_at,
-            gc_eligible, gc_protected
-        ) VALUES (
-            ?, ?, ?, ?, ?,
-            ?, ?,
-            ?, ?, ?,
-            ?, ?, ?,
-            ?, ?, ?, ?,
-            NULL, 0,
-            NULL, NULL,
-            ?, ?, ?,
-            0, 0,
-            NULL, NULL,
-            0, ?
+    try:
+        conn.execute(
+            """
+            INSERT INTO memories (
+                id, content, content_hash, memory_type, importance,
+                extraction_confidence, confidence,
+                subject, predicate, object,
+                session_id, source_expert, project,
+                created_at, event_time, valid_from, valid_to,
+                last_accessed_at, access_count,
+                superseded_by, superseded_at,
+                decay_rate, stability, temporal_confidence,
+                reinforcement_count, promotion_candidate,
+                temporal_score, score_computed_at,
+                gc_eligible, gc_protected
+            ) VALUES (
+                ?, ?, ?, ?, ?,
+                ?, ?,
+                ?, ?, ?,
+                ?, ?, ?,
+                ?, ?, ?, ?,
+                NULL, 0,
+                NULL, NULL,
+                ?, ?, ?,
+                0, 0,
+                NULL, NULL,
+                0, ?
+            )
+            """,
+            (
+                memory_id, content, content_hash, memory_type, importance,
+                float(memory_dict.get("extraction_confidence") or memory_dict.get("confidence", 0.8)),
+                1.0,  # retrieval confidence starts at 1.0, reduced on contradiction
+                memory_dict.get("subject"),
+                memory_dict.get("predicate"),
+                memory_dict.get("object"),
+                session_id,
+                memory_dict.get("source_expert"),
+                project,
+                now,
+                memory_dict.get("event_time"),
+                memory_dict.get("valid_from"),
+                memory_dict.get("valid_to"),
+                decay_rate,
+                stability,
+                float(memory_dict.get("temporal_confidence", 1.0)),
+                gc_protected,
+            ),
         )
-        """,
-        (
-            memory_id, content, content_hash, memory_type, importance,
-            float(memory_dict.get("extraction_confidence") or memory_dict.get("confidence", 0.8)),
-            1.0,  # retrieval confidence starts at 1.0, reduced on contradiction
-            memory_dict.get("subject"),
-            memory_dict.get("predicate"),
-            memory_dict.get("object"),
-            session_id,
-            memory_dict.get("source_expert"),
-            project,
-            now,
-            memory_dict.get("event_time"),
-            memory_dict.get("valid_from"),
-            memory_dict.get("valid_to"),
-            decay_rate,
-            stability,
-            float(memory_dict.get("temporal_confidence", 1.0)),
-            gc_protected,
-        ),
-    )
-    conn.commit()
-    conn.close()
+        conn.commit()
+    finally:
+        conn.close()
     return memory_id
 
 

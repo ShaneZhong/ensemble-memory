@@ -125,6 +125,18 @@ def main() -> None:
         print("{}")
         return
 
+    # Add KG summary if entities exist
+    try:
+        import kg
+        stats = kg.get_entity_stats()
+        if stats.get("total_entities", 0) > 0:
+            context += (
+                f"\n\n## Knowledge Graph: {stats['total_entities']} entities, "
+                f"{stats['total_relationships']} relationships tracked"
+            )
+    except Exception:
+        pass
+
     result = {"additionalContext": context}
     print(json.dumps(result, ensure_ascii=False))
 

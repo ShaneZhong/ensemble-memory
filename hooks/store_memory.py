@@ -14,6 +14,7 @@ Env vars (passed through to write_log):
 """
 
 import json
+import os
 import sys
 import urllib.request
 from pathlib import Path
@@ -22,8 +23,8 @@ from pathlib import Path
 _HOOKS_DIR = Path(__file__).parent
 sys.path.insert(0, str(_HOOKS_DIR))
 
-import os
 import db
+import kg
 import write_log
 
 # Promotion threshold: if a procedural memory is reinforced this many times
@@ -94,8 +95,8 @@ def _store_to_sqlite(memories: list[dict], session_id: str) -> tuple[int, list[s
                 embedding = result.get("embedding")
             if embedding:
                 db.store_embedding(mem_id, embedding)
-            except Exception:
-                pass  # Embeddings are best-effort
+        except Exception:
+            pass  # Embeddings are best-effort
 
         # ── Supersession check (structured: subject+predicate match) ─────────
         subject = mem.get("subject", "")
@@ -153,6 +154,53 @@ def main() -> None:
         )
         # Notify daemon so it reloads its memory cache on next /search
         _notify_daemon_invalidate()
+
+    # ── KG entity + relationship processing ───────────────────────────────────
+    entities_raw = extraction.get("entities", [])
+    relationships_raw = extraction.get("relationships", [])
+
+    if entities_raw or relationships_raw:
+        try:
+            # Record episode for this extraction
+            episode_id = kg.record_episode(
+                session_id=session_id,
+                content=extraction_raw[:500],  # truncate for storage
+                summary="; ".join(extraction.get("summary", [])),
+                entity_names=[e.get("name", "") for e in entities_raw],
+            )
+
+            # Upsert entities
+            entity_ids = {}
+            for ent in entities_raw:
+                name = ent.get("name", "").strip()
+                if not name:
+                    continue
+                eid = kg.upsert_entity(
+                    name=name,
+                    entity_type=ent.get("type", "CONCEPT"),
+                    description=ent.get("description"),
+                    session_id=session_id,
+                )
+                entity_ids[name] = eid
+
+            # Insert relationships
+            for rel in relationships_raw:
+                kg.insert_relationship(
+                    subject_name=rel.get("subject", ""),
+                    predicate=rel.get("predicate", "RELATED_TO"),
+                    object_name=rel.get("object", ""),
+                    evidence=rel.get("evidence"),
+                    confidence=float(rel.get("confidence", 0.5)),
+                    episode_id=episode_id,
+                )
+
+            print(
+                f"[store_memory] KG: {len(entity_ids)} entities, "
+                f"{len(relationships_raw)} relationships",
+                file=sys.stderr,
+            )
+        except Exception as exc:
+            print(f"[store_memory] KG error (continuing): {exc}", file=sys.stderr)
 
     # ── Markdown write (always runs) ──────────────────────────────────────────
     # Delegate to write_log.main() by temporarily patching sys.argv so it sees

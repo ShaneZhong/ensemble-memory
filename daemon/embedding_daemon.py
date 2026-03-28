@@ -204,6 +204,67 @@ def _record_access(memory_ids: list[str]) -> None:
         pass
 
 
+_KG_STOP_WORDS = frozenset([
+    "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
+    "have", "has", "had", "do", "does", "did", "will", "would", "could",
+    "should", "may", "might", "shall", "can", "need", "must",
+    "i", "me", "my", "we", "our", "you", "your", "he", "she", "it",
+    "they", "them", "their", "this", "that", "these", "those",
+    "what", "which", "who", "whom", "how", "when", "where", "why",
+    "and", "or", "but", "not", "no", "nor", "so", "if", "then",
+    "for", "of", "to", "in", "on", "at", "by", "with", "from", "up",
+    "about", "into", "through", "during", "before", "after",
+    "use", "using", "used", "get", "set", "make", "let", "just",
+])
+
+
+def _get_kg_context(query_text: str) -> str:
+    """Get KG neighborhood context for entities mentioned in query.
+
+    Extracts keywords from the query and searches FTS5 per-keyword,
+    since FTS5 requires exact token matches (no stemming).
+    """
+    try:
+        hooks_dir = str(Path(__file__).parent.parent / "hooks")
+        if hooks_dir not in sys.path:
+            sys.path.insert(0, hooks_dir)
+        import kg
+
+        # Extract meaningful keywords from query
+        import re
+        words = re.findall(r'[a-zA-Z_][a-zA-Z0-9_.-]*', query_text)
+        keywords = [w for w in words if w.lower() not in _KG_STOP_WORDS and len(w) > 2]
+
+        # Generate stem-like variants by stripping common suffixes
+        expanded = set()
+        for kw in keywords:
+            expanded.add(kw)
+            low = kw.lower()
+            for suffix in ("ing", "tion", "ed", "er", "est", "ly", "ment", "ness", "es", "s"):
+                if low.endswith(suffix) and len(low) - len(suffix) >= 3:
+                    expanded.add(kw[:len(kw) - len(suffix)])
+                    break
+
+        # Search FTS5 per keyword, collect unique entities
+        seen_ids = set()
+        entities = []
+        for kw in expanded:
+            hits = kg.search_entities_fts(kw, limit=3)
+            for ent in hits:
+                if ent["id"] not in seen_ids:
+                    seen_ids.add(ent["id"])
+                    entities.append(ent)
+
+        if not entities:
+            return ""
+
+        entity_names = [e["name"] for e in entities[:5]]
+        neighborhood = kg.kg_entity_neighborhood(entity_names, max_depth=2, max_neighbors=3)
+        return neighborhood.get("formatted_prefix", "")
+    except Exception:
+        return ""
+
+
 def _search(query: str, project: str) -> dict:
     """Core search logic. Returns {"hits": [...], "context": "..."}."""
     memories = _load_memories(project)
@@ -248,7 +309,12 @@ def _search(query: str, project: str) -> dict:
     global _memories_cache
     _memories_cache = []
 
-    context = _format_context(hits)
+    context_parts = [_format_context(hits)]
+    kg_context = _get_kg_context(query)
+    if kg_context:
+        context_parts.append(f"\n## Related Knowledge\n{kg_context}")
+    context = "".join(context_parts)
+
     return {"hits": hits, "context": context}
 
 
@@ -314,6 +380,36 @@ class _Handler(BaseHTTPRequestHandler):
             _memories_cache = []
             _cache_loaded_at = 0.0
             self._send_json(200, {"invalidated": True})
+
+        elif self.path == "/embed":
+            body = self._read_body()
+            text = body.get("text", "")
+            if not text:
+                self._send_json(400, {"error": "text required"})
+                return
+            # all-MiniLM-L6-v2 truncates at 256 tokens (~512 chars).
+            # Pre-truncate to avoid wasting time on text that won't be encoded.
+            text = text[:512]
+            embedding = _get_embedding(text)
+            if embedding is None:
+                self._send_json(503, {"error": "embedding model not available"})
+                return
+            self._send_json(200, {"embedding": embedding})
+
+        elif self.path == "/embed_batch":
+            body = self._read_body()
+            texts = body.get("texts", [])
+            if not isinstance(texts, list) or not texts:
+                self._send_json(400, {"error": "texts must be a non-empty list"})
+                return
+            embeddings = []
+            for text in texts:
+                emb = _get_embedding(str(text)[:512])
+                embeddings.append(emb)
+            if any(e is None for e in embeddings):
+                self._send_json(503, {"error": "embedding model not available"})
+                return
+            self._send_json(200, {"embeddings": embeddings})
 
         else:
             self._send_json(404, {"error": "not found"})

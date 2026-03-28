@@ -92,11 +92,17 @@ def call_ollama(prompt: str) -> dict:
 
 
 def validate_extraction(data: dict) -> bool:
-    """Return True if data has 'memories' list and 'summary' list."""
-    return (
-        isinstance(data.get("memories"), list)
-        and isinstance(data.get("summary"), list)
-    )
+    """Return True if data has valid extraction structure."""
+    if not isinstance(data.get("memories"), list):
+        return False
+    if not isinstance(data.get("summary"), list):
+        return False
+    # entities and relationships are optional but must be lists if present
+    if "entities" in data and not isinstance(data["entities"], list):
+        return False
+    if "relationships" in data and not isinstance(data["relationships"], list):
+        return False
+    return True
 
 
 def load_prompt_template() -> str:
@@ -115,6 +121,26 @@ def main() -> int:
     signal_hints_raw = sys.argv[2]
 
     turn_text = turn_file.read_text(encoding="utf-8")
+
+    # Smart truncation: keep user text fully (contains corrections/decisions),
+    # truncate assistant text (usually long code/explanations).
+    # Turn format from stop.sh: "Human: ...\n\nAssistant: ..."
+    MAX_TURN_CHARS = 6000
+    if len(turn_text) > MAX_TURN_CHARS:
+        # Split at "Assistant:" boundary to preserve user text
+        split_marker = "\n\nAssistant:"
+        split_idx = turn_text.find(split_marker)
+        if split_idx > 0:
+            user_part = turn_text[:split_idx]
+            assistant_part = turn_text[split_idx + len(split_marker):]
+            remaining = MAX_TURN_CHARS - len(user_part) - len(split_marker)
+            if remaining > 200:
+                turn_text = user_part + split_marker + assistant_part[:remaining] + "\n[...truncated...]"
+            else:
+                # User text alone exceeds limit — truncate it too
+                turn_text = turn_text[:MAX_TURN_CHARS] + "\n[...truncated...]"
+        else:
+            turn_text = turn_text[:MAX_TURN_CHARS] + "\n[...truncated...]"
 
     template = load_prompt_template()
     prompt = template.replace("{signal_hints}", signal_hints_raw).replace(
