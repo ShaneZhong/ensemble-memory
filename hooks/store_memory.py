@@ -15,10 +15,13 @@ Env vars (passed through to write_log):
 
 import hashlib
 import json
+import logging
 import os
 import sys
 import urllib.request
 from pathlib import Path
+
+logger = logging.getLogger("ensemble_memory.store_memory")
 
 # ── Locate siblings without hardcoded paths ───────────────────────────────────
 _HOOKS_DIR = Path(__file__).parent
@@ -114,10 +117,10 @@ def _store_to_sqlite(memories: list[dict], session_id: str, entities_raw: list[d
                 )
                 if enriched:
                     db.store_enrichment(mem_id, enriched["text"], enriched["quality"])
-                    print(
-                        f"[store_memory] Enriched {mem_id[:8]} "
-                        f"(quality={enriched['quality']:.2f})",
-                        file=sys.stderr,
+                    logger.info(
+                        "[store_memory] Enriched %s (quality=%.2f)",
+                        mem_id[:8],
+                        enriched["quality"],
                     )
                     # Re-embed with enriched text
                     try:
@@ -136,7 +139,7 @@ def _store_to_sqlite(memories: list[dict], session_id: str, entities_raw: list[d
                     except Exception:
                         pass  # Re-embed is best-effort
             except Exception as exc:
-                print(f"[store_memory] Enrichment failed: {exc}", file=sys.stderr)
+                logger.warning("[store_memory] Enrichment failed: %s", exc)
 
         # ── Supersession check (structured: subject+predicate match) ─────────
         predicate = mem.get("predicate", "")

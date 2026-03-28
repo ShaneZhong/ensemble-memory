@@ -11,6 +11,7 @@ is preserved with its original embedding.
 """
 
 import json
+import logging
 import os
 import re
 import sys
@@ -19,6 +20,8 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 from typing import Optional
+
+logger = logging.getLogger("ensemble_memory.enrich")
 
 _HOOKS_DIR = Path(__file__).parent
 if str(_HOOKS_DIR) not in sys.path:
@@ -176,7 +179,7 @@ def _enrich_via_llm(
         return text if text else None
 
     except Exception as exc:
-        print(f"[enrich] LLM path failed: {exc}", file=sys.stderr)
+        logger.warning("[enrich] LLM path failed: %s", exc)
         return None
 
 
@@ -238,7 +241,7 @@ def enrich_batch(min_importance: int = 6, limit: int = 100, dry_run: bool = Fals
     try:
         rows = conn.execute(
             """
-            SELECT id, content, memory_type, importance, subject
+            SELECT id, content, memory_type, importance, subject, session_id
             FROM memories
             WHERE enriched_text IS NULL
               AND importance >= ?
@@ -257,8 +260,29 @@ def enrich_batch(min_importance: int = 6, limit: int = 100, dry_run: bool = Fals
         memory_type = row[2]
         importance = row[3]
         subject = row[4]
+        session_id = row[5]
 
-        result = enrich_memory(content, memory_type, importance, [], subject)
+        # Load entity names from KG for this memory
+        entity_names = []
+        try:
+            import kg
+            kg_conn = db.get_db()
+            entity_rows = kg_conn.execute(
+                """
+                SELECT DISTINCT e.name FROM kg_entities e
+                JOIN kg_appears_in ai ON ai.entity_id = e.id
+                JOIN kg_episodes ep ON ep.id = ai.episode_id
+                WHERE ep.session_id = ?
+                LIMIT 10
+                """,
+                (session_id,),
+            ).fetchall()
+            entity_names = [r["name"] for r in entity_rows]
+            kg_conn.close()
+        except Exception:
+            pass  # KG lookup is best-effort
+
+        result = enrich_memory(content, memory_type, importance, entity_names, subject)
         if result and not dry_run:
             db.store_enrichment(mem_id, result["text"], result["quality"])
             enriched_count += 1

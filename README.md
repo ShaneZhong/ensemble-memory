@@ -132,6 +132,8 @@ All settings via environment variables or `~/.ensemble_memory/config.toml`:
 | `ENSEMBLE_MEMORY_EMBED_MODEL` | `all-MiniLM-L6-v2` | Embedding model |
 | `ENSEMBLE_MEMORY_TIMEOUT` | `30` | Extraction timeout (seconds) |
 | `ENSEMBLE_MEMORY_PYTHON` | `python3` | Python interpreter path |
+| `ENSEMBLE_MEMORY_ENRICH_ENABLED` | `1` | Enable contextual enrichment (0 to disable) |
+| `ENSEMBLE_MEMORY_MIN_ENRICH_IMPORTANCE` | `6` | Minimum importance for enrichment |
 
 ## Features
 

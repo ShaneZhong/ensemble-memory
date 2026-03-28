@@ -269,6 +269,23 @@ class TestEnrichMemory(unittest.TestCase):
         )
         self.assertIsNone(result)
 
+    def test_compute_quality_edge_cases(self):
+        """Quality score should handle edge cases."""
+        import enrich
+        # Empty enrichment
+        q1 = enrich._compute_quality("", "", False)
+        self.assertGreaterEqual(q1, 0.0)
+        self.assertLessEqual(q1, 1.0)
+
+        # Identical strings (no novelty)
+        q2 = enrich._compute_quality("hello world", "hello world", False)
+        self.assertLessEqual(q2, 0.8)  # No novelty score
+
+        # KG bonus
+        q3 = enrich._compute_quality("enriched context here", "original", True)
+        q4 = enrich._compute_quality("enriched context here", "original", False)
+        self.assertGreater(q3, q4)  # KG bonus should increase score
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 5. TestSchemaAndStorage
@@ -289,6 +306,16 @@ class TestSchemaAndStorage(TempDirMixin):
             conn.execute("SELECT enriched_text, enrichment_quality FROM memories LIMIT 1")
         finally:
             conn.close()
+
+    def test_store_enrichment_nonexistent_memory(self):
+        """store_enrichment on non-existent memory ID should not crash."""
+        # This is a no-op UPDATE (0 rows affected) — should not raise
+        db.store_enrichment("nonexistent-uuid", "enriched text", 0.8)
+        # Verify nothing was inserted
+        conn = db.get_db()
+        row = conn.execute("SELECT * FROM memories WHERE id = 'nonexistent-uuid'").fetchone()
+        conn.close()
+        self.assertIsNone(row)
 
     def test_store_enrichment_updates_row(self):
         """store_enrichment() updates enriched_text and enrichment_quality columns."""
