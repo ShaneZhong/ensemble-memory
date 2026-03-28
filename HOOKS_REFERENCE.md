@@ -122,11 +122,12 @@ The daemon is called by `user_prompt_submit.py` and `kg.py`. All endpoints accep
 
 | Endpoint | Method | Request | Response |
 |----------|--------|---------|----------|
-| `/search` | POST | `{"query": "...", "project": "...", "top_k": 5}` | `{"results": [...], "kg_context": "..."}` |
+| `/search` | POST | `{"query": "...", "project": "..."}` | `{"hits": [...], "context": "..."}` (RRF fusion: cosine + BM25 + temporal + importance) |
 | `/embed` | POST | `{"text": "..."}` | `{"embedding": [0.1, ...]}` (384-dim) |
 | `/embed_batch` | POST | `{"texts": ["...", "..."]}` | `{"embeddings": [[...], [...]]}` |
-| `/health` | GET | — | `{"status": "ok", "model": "..."}` |
-| `/invalidate_cache` | POST | `{}` | `{"ok": true}` |
+| `/log_feedback` | POST | `{"query": "...", "type": "miss", "session_id": "..."}` | `{"logged": true}` (retrieval feedback logging) |
+| `/health` | GET | — | `{"status": "ok"}` |
+| `/invalidate_cache` | POST | `{}` | `{"invalidated": true}` |
 
 **Error codes**: 400 (missing fields), 503 (model not loaded), 200 (success).
 

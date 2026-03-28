@@ -13,6 +13,7 @@ Env vars (passed through to write_log):
     TRANSCRIPT_PATH        Source transcript path  (metadata only)
 """
 
+import hashlib
 import json
 import os
 import sys
@@ -113,6 +114,19 @@ def _store_to_sqlite(memories: list[dict], session_id: str) -> tuple[int, list[s
             )
             if superseded:
                 superseded_ids.append(superseded)
+
+        # ── Decision vault write (if decision_type present) ──────────────────
+        decision_type = mem.get("decision_type")
+        if decision_type:
+            db.insert_decision(
+                memory_id=mem_id,
+                decision_type=decision_type,
+                content_hash=hashlib.sha256(content.encode()).hexdigest(),
+                keywords=mem.get("keywords"),
+                files_referenced=mem.get("files_referenced"),
+                project=PROJECT,
+                session_id=session_id,
+            )
 
     return new_count, superseded_ids
 

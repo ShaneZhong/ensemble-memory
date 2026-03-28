@@ -265,15 +265,117 @@ def _get_kg_context(query_text: str) -> str:
         return ""
 
 
+def _bm25_search(query: str, project: str, limit: int = 20) -> list[dict]:
+    """Search memories + decisions via FTS5 BM25 ranking.
+
+    Queries both decisions_fts (Phase 4) and a direct LIKE search on memories
+    as BM25 fallback (no FTS5 on memories table yet).
+    Returns list of dicts with id, content, bm25_rank.
+    """
+    try:
+        import db
+    except ImportError:
+        return []
+
+    results = []
+    try:
+        conn = db.get_db()
+
+        # 1. Search decisions via FTS5 BM25
+        try:
+            params_d: list = [query]
+            project_clause = ""
+            if project:
+                project_clause = "AND d.project = ?"
+                params_d.append(project)
+            params_d.append(limit)
+
+            rows = conn.execute(
+                f"""
+                SELECT d.memory_id AS id, m.content, m.memory_type,
+                       m.importance, bm25(decisions_fts) AS bm25_score
+                FROM decisions_fts
+                JOIN decisions d ON d.rowid = decisions_fts.rowid
+                JOIN memories m ON m.id = d.memory_id
+                WHERE decisions_fts MATCH ?
+                  {project_clause}
+                ORDER BY bm25(decisions_fts)
+                LIMIT ?
+                """,
+                params_d,
+            ).fetchall()
+            for i, row in enumerate(rows):
+                results.append({
+                    "id": row["id"],
+                    "content": row["content"],
+                    "memory_type": row["memory_type"],
+                    "importance": row["importance"],
+                    "bm25_rank": i + 1,
+                    "source": "decisions_fts",
+                })
+        except Exception:
+            pass  # decisions_fts may not exist yet
+
+        # 2. Simple keyword search on memories as BM25 proxy
+        # Use LIKE with keywords extracted from query
+        import re
+        words = re.findall(r'[a-zA-Z_][a-zA-Z0-9_.-]*', query)
+        keywords = [w for w in words if w.lower() not in _KG_STOP_WORDS and len(w) > 2]
+
+        if keywords:
+            seen_ids = {r["id"] for r in results}
+            # Build OR conditions for keyword matching
+            like_clauses = " OR ".join(["content LIKE ?" for _ in keywords])
+            like_params: list = [f"%{kw}%" for kw in keywords[:5]]  # limit to 5 keywords
+
+            params_m: list = []
+            proj_clause_m = ""
+            if project:
+                proj_clause_m = "AND (project = ? OR project LIKE ? || '/%' OR ? LIKE project || '/%')"
+                params_m.extend([project, project, project])
+
+            mem_rows = conn.execute(
+                f"""
+                SELECT id, content, memory_type, importance
+                FROM memories
+                WHERE ({like_clauses})
+                  AND superseded_by IS NULL
+                  AND gc_eligible = 0
+                  {proj_clause_m}
+                ORDER BY importance DESC, created_at DESC
+                LIMIT ?
+                """,
+                like_params + params_m + [limit],
+            ).fetchall()
+
+            for i, row in enumerate(mem_rows):
+                if row["id"] not in seen_ids:
+                    results.append({
+                        "id": row["id"],
+                        "content": row["content"],
+                        "memory_type": row["memory_type"],
+                        "importance": row["importance"],
+                        "bm25_rank": len(results) + 1,
+                        "source": "memories_keyword",
+                    })
+
+        conn.close()
+    except Exception:
+        pass
+
+    return results
+
+
 def _search(query: str, project: str) -> dict:
-    """Core search logic. Returns {"hits": [...], "context": "..."}."""
+    """Core search logic with RRF fusion. Returns {"hits": [...], "context": "..."}."""
     memories = _load_memories(project)
     if not memories:
         return {"hits": [], "context": ""}
 
     query_emb = _get_embedding(query) if _has_embeddings else None
 
-    scored = []
+    # ── Signal 1: Cosine similarity ranking ─────────────────────────────
+    cosine_ranked = []
     for mem in memories:
         if mem.get("memory_type") not in RETRIEVABLE_TYPES:
             continue
@@ -283,19 +385,66 @@ def _search(query: str, project: str) -> dict:
 
         if query_emb is not None and mem.get("embedding") is not None:
             sim = _cosine_similarity(query_emb, mem["embedding"])
-            threshold = SIMILARITY_THRESHOLD
         else:
             sim = _keyword_similarity(query, mem.get("content", ""))
-            threshold = KEYWORD_THRESHOLD
 
-        if sim < threshold:
-            continue
-
-        scored.append({
-            **mem,
+        cosine_ranked.append({
+            "id": mem["id"],
+            "content": mem.get("content", ""),
+            "memory_type": mem.get("memory_type", ""),
+            "importance": mem.get("importance", 5),
+            "subject": mem.get("subject"),
             "similarity": sim,
             "temporal_score": t_score,
-            "final_score": sim * (0.5 + t_score * 0.5),
+            **{k: mem[k] for k in ("access_count", "last_accessed_at", "created_at",
+                                    "decay_rate", "stability") if k in mem},
+        })
+
+    cosine_ranked.sort(key=lambda x: x["similarity"], reverse=True)
+
+    # ── Signal 2: BM25 ranking ──────────────────────────────────────────
+    bm25_results = _bm25_search(query, project, limit=20)
+
+    # ── RRF Fusion ──────────────────────────────────────────────────────
+    RRF_K = 60
+    rrf_scores: dict[str, float] = {}
+    all_items: dict[str, dict] = {}
+
+    # Cosine signal (top 50)
+    for rank, item in enumerate(cosine_ranked[:50], start=1):
+        mid = item["id"]
+        rrf_scores[mid] = rrf_scores.get(mid, 0.0) + 1.0 / (RRF_K + rank)
+        all_items[mid] = item
+
+    # BM25 signal
+    for bm25_item in bm25_results:
+        mid = bm25_item["id"]
+        rank = bm25_item["bm25_rank"]
+        rrf_scores[mid] = rrf_scores.get(mid, 0.0) + 1.0 / (RRF_K + rank)
+        if mid not in all_items:
+            all_items[mid] = {
+                "id": mid,
+                "content": bm25_item.get("content", ""),
+                "memory_type": bm25_item.get("memory_type", ""),
+                "importance": bm25_item.get("importance", 5),
+                "similarity": 0.0,
+                "temporal_score": 0.5,  # default for BM25-only hits
+            }
+
+    # Build final scored list
+    scored = []
+    for mid, rrf_score in rrf_scores.items():
+        item = all_items[mid]
+        t_score = item.get("temporal_score", 0.5)
+        importance = item.get("importance", 5) / 10.0
+
+        # Final score: RRF * (temporal + importance blend)
+        final = rrf_score * (0.4 + t_score * 0.3 + importance * 0.3)
+
+        scored.append({
+            **item,
+            "rrf_score": rrf_score,
+            "final_score": final,
         })
 
     scored.sort(key=lambda x: x["final_score"], reverse=True)
@@ -305,7 +454,6 @@ def _search(query: str, project: str) -> dict:
         return {"hits": [], "context": ""}
 
     _record_access([h["id"] for h in hits])
-    # Invalidate cache so next load picks up updated access counts
     global _memories_cache
     _memories_cache = []
 
@@ -411,6 +559,31 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             self._send_json(200, {"embeddings": embeddings})
 
+        elif self.path == "/log_feedback":
+            body = self._read_body()
+            query = body.get("query", "")
+            feedback_type = body.get("type", "miss")  # "miss" = user said "I already told you"
+            session_id = body.get("session_id", "")
+
+            # Log to JSONL file
+            import datetime
+            log_dir = Path(os.environ.get("ENSEMBLE_MEMORY_DIR",
+                          str(Path.home() / ".ensemble_memory"))) / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            log_file = log_dir / "retrieval_feedback.jsonl"
+            entry = {
+                "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "query": query[:500],
+                "type": feedback_type,
+                "session_id": session_id,
+            }
+            try:
+                with open(log_file, "a") as f:
+                    f.write(json.dumps(entry) + "\n")
+            except Exception:
+                pass
+            self._send_json(200, {"logged": True})
+
         else:
             self._send_json(404, {"error": "not found"})
 
@@ -420,6 +593,15 @@ class _Handler(BaseHTTPRequestHandler):
 def main() -> None:
     print(f"[daemon] Starting on port {PORT}", flush=True)
     _load_model()
+
+    # Run importance decay on startup (cheap, ~1ms)
+    try:
+        import db
+        decayed = db.decay_stale_importance(days_threshold=30, floor=3)
+        if decayed:
+            print(f"[daemon] Decayed importance for {decayed} stale memories", flush=True)
+    except Exception:
+        pass
 
     server = HTTPServer(("127.0.0.1", PORT), _Handler)
     print(f"[daemon] Ready", flush=True)

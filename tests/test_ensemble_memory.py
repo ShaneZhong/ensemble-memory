@@ -1300,6 +1300,251 @@ class TestDaemonEmbedEndpoint(unittest.TestCase):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Phase 4 Sprint 1 Tests
+# ═══════════════════════════════════════════════════════════════════════════════
+
+import extract  # noqa: E402 — imported after HOOKS_DIR is on path
+
+
+class TestPhase4Sprint1(TempDirMixin, unittest.TestCase):
+    """Phase 4 Sprint 1: importance decay, near-dedup Jaccard, Decision Vault."""
+
+    # ── Importance Decay ──────────────────────────────────────────────────────
+
+    def test_importance_decay_basic(self):
+        """Memories older than threshold should have importance decremented by 1."""
+        id7 = db.insert_memory({"content": "Memory importance seven", "type": "semantic", "importance": 7}, "session1", "/test/project")
+        id5 = db.insert_memory({"content": "Memory importance five", "type": "semantic", "importance": 5}, "session1", "/test/project")
+        id4 = db.insert_memory({"content": "Memory importance four", "type": "semantic", "importance": 4}, "session1", "/test/project")
+
+        past_time = time.time() - (40 * 86400)
+        conn = db.get_db()
+        conn.execute("UPDATE memories SET created_at = ?, last_accessed_at = NULL WHERE id = ?", (past_time, id7))
+        conn.execute("UPDATE memories SET created_at = ?, last_accessed_at = NULL WHERE id = ?", (past_time, id5))
+        conn.execute("UPDATE memories SET created_at = ?, last_accessed_at = NULL WHERE id = ?", (past_time, id4))
+        conn.commit()
+        conn.close()
+
+        count = db.decay_stale_importance(days_threshold=30, floor=3)
+        self.assertEqual(count, 3)
+
+        conn = db.get_db()
+        row7 = conn.execute("SELECT importance FROM memories WHERE id = ?", (id7,)).fetchone()
+        row5 = conn.execute("SELECT importance FROM memories WHERE id = ?", (id5,)).fetchone()
+        row4 = conn.execute("SELECT importance FROM memories WHERE id = ?", (id4,)).fetchone()
+        conn.close()
+
+        self.assertEqual(row7["importance"], 6)
+        self.assertEqual(row5["importance"], 4)
+        self.assertEqual(row4["importance"], 3)
+
+    def test_importance_decay_floor(self):
+        """Memories already at the floor should not be decayed."""
+        mem_id = db.insert_memory({"content": "Memory at floor importance", "type": "semantic", "importance": 3}, "session1", "/test/project")
+
+        past_time = time.time() - (60 * 86400)
+        conn = db.get_db()
+        conn.execute("UPDATE memories SET created_at = ?, last_accessed_at = NULL WHERE id = ?", (past_time, mem_id))
+        conn.commit()
+        conn.close()
+
+        count = db.decay_stale_importance(days_threshold=30, floor=3)
+        self.assertEqual(count, 0)
+
+        conn = db.get_db()
+        row = conn.execute("SELECT importance FROM memories WHERE id = ?", (mem_id,)).fetchone()
+        conn.close()
+        self.assertEqual(row["importance"], 3)
+
+    def test_importance_decay_recently_accessed(self):
+        """Memories accessed recently should not be decayed even if created long ago."""
+        mem_id = db.insert_memory({"content": "Memory recently accessed", "type": "semantic", "importance": 7}, "session1", "/test/project")
+
+        past_created = time.time() - (40 * 86400)
+        recent_accessed = time.time() - (5 * 86400)
+        conn = db.get_db()
+        conn.execute(
+            "UPDATE memories SET created_at = ?, last_accessed_at = ? WHERE id = ?",
+            (past_created, recent_accessed, mem_id),
+        )
+        conn.commit()
+        conn.close()
+
+        db.decay_stale_importance(days_threshold=30, floor=3)
+
+        conn = db.get_db()
+        row = conn.execute("SELECT importance FROM memories WHERE id = ?", (mem_id,)).fetchone()
+        conn.close()
+        self.assertEqual(row["importance"], 7)
+
+    # ── Near-Dedup Jaccard ────────────────────────────────────────────────────
+
+    def test_near_dedup_jaccard(self):
+        """Near-duplicate content in the same project should return the original id.
+
+        Uses strings with Jaccard >= 0.85 (one is a near-superset of the other).
+        Shared words: Use Redis Stack for the cache layer not plain Redis (9 words)
+        Union: 10 words → Jaccard = 0.9.
+        """
+        orig_id = db.insert_memory(
+            {"content": "Use Redis Stack for the cache layer not plain Redis", "type": "semantic", "importance": 6},
+            "session1", "/test/project",
+        )
+        dup_id = db.insert_memory(
+            {"content": "Use Redis Stack for the cache layer not plain Redis always", "type": "semantic", "importance": 6},
+            "session1", "/test/project",
+        )
+        self.assertEqual(dup_id, orig_id)
+
+        conn = db.get_db()
+        row = conn.execute("SELECT access_count FROM memories WHERE id = ?", (orig_id,)).fetchone()
+        conn.close()
+        self.assertEqual(row["access_count"], 1)
+
+    def test_near_dedup_different_content(self):
+        """Sufficiently different content should produce distinct memory ids."""
+        id1 = db.insert_memory(
+            {"content": "Use SQLite for storage", "type": "semantic", "importance": 5},
+            "session1", "/test/project",
+        )
+        id2 = db.insert_memory(
+            {"content": "Use PostgreSQL for production database", "type": "semantic", "importance": 5},
+            "session1", "/test/project",
+        )
+        self.assertNotEqual(id1, id2)
+
+    def test_near_dedup_does_not_cross_projects(self):
+        """Near-duplicate detection should be scoped to project.
+
+        Uses the same high-Jaccard string pair as test_near_dedup_jaccard but
+        in different projects — they must produce distinct ids.
+        """
+        id_foo = db.insert_memory(
+            {"content": "Use Redis Stack for the cache layer not plain Redis", "type": "semantic", "importance": 6},
+            "session1", "/foo",
+        )
+        id_bar = db.insert_memory(
+            {"content": "Use Redis Stack for the cache layer not plain Redis always", "type": "semantic", "importance": 6},
+            "session1", "/bar",
+        )
+        self.assertNotEqual(id_foo, id_bar)
+
+    # ── Decision Vault ────────────────────────────────────────────────────────
+
+    def test_insert_decision_basic(self):
+        """Inserting a decision should return a non-None id and persist the row."""
+        mem_id = db.insert_memory(
+            {"content": "Use Redis Stack for cache layer", "type": "semantic", "importance": 7},
+            "sess1", "/test",
+        )
+        decision_id = db.insert_decision(
+            memory_id=mem_id,
+            decision_type="ARCHITECTURAL",
+            content_hash="abc123",
+            keywords=["redis", "cache"],
+            project="/test",
+            session_id="sess1",
+        )
+        self.assertIsNotNone(decision_id)
+
+        conn = db.get_db()
+        row = conn.execute("SELECT * FROM decisions WHERE id = ?", (decision_id,)).fetchone()
+        conn.close()
+        self.assertIsNotNone(row)
+        self.assertEqual(row["memory_id"], mem_id)
+        self.assertEqual(row["decision_type"], "ARCHITECTURAL")
+        self.assertEqual(row["content_hash"], "abc123")
+        self.assertEqual(row["project"], "/test")
+        self.assertEqual(row["session_id"], "sess1")
+
+    def test_insert_decision_normalization(self):
+        """decision_type with pipe-separated values should normalize to first valid token."""
+        mem_id = db.insert_memory(
+            {"content": "Prefer functional patterns", "type": "semantic", "importance": 5},
+            "sess1", "/test",
+        )
+        decision_id = db.insert_decision(
+            memory_id=mem_id,
+            decision_type="ARCHITECTURAL | PREFERENCE",
+            content_hash="norm_hash_001",
+            project="/test",
+            session_id="sess1",
+        )
+        self.assertIsNotNone(decision_id)
+
+        conn = db.get_db()
+        row = conn.execute("SELECT decision_type FROM decisions WHERE id = ?", (decision_id,)).fetchone()
+        conn.close()
+        self.assertEqual(row["decision_type"], "ARCHITECTURAL")
+
+    def test_insert_decision_invalid_type(self):
+        """An unrecognised decision_type should cause insert_decision to return None."""
+        mem_id = db.insert_memory(
+            {"content": "Some random memory", "type": "semantic", "importance": 5},
+            "sess1", "/test",
+        )
+        result = db.insert_decision(
+            memory_id=mem_id,
+            decision_type="INVALID_TYPE",
+            content_hash="invalid_hash_001",
+            project="/test",
+            session_id="sess1",
+        )
+        self.assertIsNone(result)
+
+    def test_insert_decision_dedup(self):
+        """Inserting a decision with the same content_hash+project should return the existing id."""
+        mem_id = db.insert_memory(
+            {"content": "Use Redis Stack", "type": "semantic", "importance": 6},
+            "sess1", "/test",
+        )
+        id1 = db.insert_decision(
+            memory_id=mem_id,
+            decision_type="ARCHITECTURAL",
+            content_hash="dedup_hash_999",
+            project="/test",
+            session_id="sess1",
+        )
+        id2 = db.insert_decision(
+            memory_id=mem_id,
+            decision_type="ARCHITECTURAL",
+            content_hash="dedup_hash_999",
+            project="/test",
+            session_id="sess2",
+        )
+        self.assertIsNotNone(id1)
+        self.assertEqual(id1, id2)
+
+    def test_search_decisions_bm25(self):
+        """BM25 search should return a decision matching the query terms."""
+        mem_id = db.insert_memory(
+            {"content": "Use Redis Stack for cache layer not plain Redis", "type": "semantic", "importance": 7},
+            "sess1", "/test",
+        )
+        db.insert_decision(
+            memory_id=mem_id,
+            decision_type="ARCHITECTURAL",
+            content_hash="bm25_test_hash",
+            keywords=["redis", "cache"],
+            project="/test",
+            session_id="sess1",
+        )
+
+        results = db.search_decisions_bm25("redis cache")
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["decision_type"], "ARCHITECTURAL")
+        self.assertIn("Redis", results[0]["content"])
+
+    def test_decision_type_in_extraction_validation(self):
+        """validate_extraction should return True when memories include a decision_type field."""
+        data = {
+            "memories": [{"type": "semantic", "decision_type": "ARCHITECTURAL"}],
+            "summary": ["test"],
+        }
+        self.assertTrue(extract.validate_extraction(data))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Runner
 # ═══════════════════════════════════════════════════════════════════════════════
 

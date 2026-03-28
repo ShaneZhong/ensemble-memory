@@ -20,7 +20,8 @@ conversation turn and extract important memories. Output ONLY valid JSON.
       "object": "target value (e.g. 'SQLite', '3.11')",
       "rule": "for procedural: imperative rule statement, else null",
       "what_went_wrong": "for corrections: what went wrong, else null",
-      "how_it_was_resolved": "for corrections: how it was fixed, else null"
+      "how_it_was_resolved": "for corrections: how it was fixed, else null",
+      "decision_type": "ARCHITECTURAL | PREFERENCE | ERROR_RESOLUTION | CONSTRAINT | PATTERN | null (only for decisions about tools, architecture, constraints, preferences)"
     }
   ],
   "entities": [

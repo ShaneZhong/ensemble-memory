@@ -140,14 +140,17 @@ All settings via environment variables or `~/.ensemble_memory/config.toml`:
 - Ollama `format: "json"` constrained generation for reliable output
 - SQLite hub with full temporal metadata (decay rates, stability, supersession chains)
 - Content-hash dedup at SQLite level (no duplicate memories)
+- Near-dedup via Jaccard similarity (>= 0.85) — catches rephrased duplicates
 - Embedding generated on insert (all-MiniLM-L6-v2, 384-dim)
+- **Decision vault**: typed decision index (ARCHITECTURAL, PREFERENCE, ERROR_RESOLUTION, CONSTRAINT, PATTERN) with FTS5 BM25 search
 - Reinforcement tracking (repeated patterns flag promotion candidates for CLAUDE.md)
 - Human-readable markdown daily logs as source of truth
 
 ### Recall
 - **SessionStart**: loads standing corrections and rules (importance >= 7) as baseline context
-- **UserPromptSubmit**: semantic query-time retrieval — embeds the user's prompt, finds similar memories via cosine similarity, injects only relevant ones as context BEFORE Claude responds
+- **UserPromptSubmit**: hybrid retrieval — RRF fusion of cosine similarity + BM25 keyword search + temporal decay + importance scoring. Injects only relevant memories as context BEFORE Claude responds
 - Temporal decay scoring (ACT-R Petrov + Ebbinghaus forgetting curve) weights fresher memories higher
+- **Importance decay**: memories not accessed in 30 days lose 1 importance point (floor at 3), keeping retrieval surface fresh
 
 ### Knowledge Graph
 - **Entity extraction**: entities (name, type, description) extracted from each turn alongside memories
@@ -193,14 +196,14 @@ Full design: [final_design.md](../synthesis/final_design.md) (1,931 lines)
 ensemble-memory/
 ├── daemon/
 │   ├── embedding_daemon.py    # Persistent HTTP server (port 9876, ~200MB RAM)
-│   │                          #   endpoints: /search, /embed, /embed_batch,
-│   │                          #   /invalidate_cache, /health
+│   │                          #   endpoints: /search (RRF fusion), /embed,
+│   │                          #   /embed_batch, /invalidate_cache, /health,
+│   │                          #   /log_feedback
 │   └── daemon_ctl.sh          # start/stop/restart/status management
 ├── hooks/
 │   ├── db.py                  # SQLite hub (schema, temporal scoring, supersession,
-│   │                          #   KG tables: kg_entities, kg_relationships,
-│   │                          #   kg_memory_links, kg_episodes, kg_appears_in,
-│   │                          #   kg_decay_config, kg_sync_state + FTS5 virtual table)
+│   │                          #   KG tables, decisions table + FTS5, importance decay,
+│   │                          #   near-dedup via Jaccard)
 │   ├── kg.py                  # Knowledge graph module (entity resolution, relationship
 │   │                          #   edges, 2-hop BFS traversal, cold-start bootstrap)
 │   ├── embeddings.py          # Sentence-transformers wrapper (all-MiniLM-L6-v2, 384-dim)
@@ -214,7 +217,7 @@ ensemble-memory/
 │   ├── user_prompt_submit.sh/py  # UserPromptSubmit hook — thin HTTP client to daemon
 │   └── prompts/extraction.txt # LLM prompt template (memories + entities + relationships)
 ├── tests/
-│   └── test_ensemble_memory.py  # 96 tests (62 Phase 1/2 + 34 Phase 3)
+│   └── test_ensemble_memory.py  # 108 tests (62 Phase 1/2 + 34 Phase 3 + 12 Phase 4)
 ├── config/default_config.toml
 ├── install.sh
 ├── HOOKS_REFERENCE.md         # Critical: hook payload/response format docs
@@ -228,7 +231,7 @@ ensemble-memory/
 python3 tests/test_ensemble_memory.py
 ```
 
-96 tests covering:
+108 tests covering:
 - Triage: 14 tests (all regex patterns, false positive rejection, case sensitivity, user-only scanning)
 - DB: 18 tests (CRUD, temporal scoring, supersession, dedup, reinforcement, confidence fields)
 - Write Log: 5 tests (file creation, format, dedup, empty memories)
@@ -239,6 +242,7 @@ python3 tests/test_ensemble_memory.py
 - Cosine Supersession: 3 tests (similar supersedes, unrelated doesn't, Jaccard fallback)
 - Knowledge Graph: 26 tests (entity upsert/dedup/merge, relationship CRUD, predicate normalization, BFS traversal, FTS5 search, episode recording, bootstrap, extraction prompt format)
 - Daemon Embed Endpoints: 8 tests (/embed and /embed_batch happy path, error cases, model-unavailable 503)
+- Phase 4 Decision Vault: 12 tests (importance decay, near-dedup Jaccard, decision CRUD, BM25 search, type normalization, cross-project isolation)
 
 ## Roadmap
 
@@ -249,8 +253,9 @@ python3 tests/test_ensemble_memory.py
 - [x] Phase 2: Cosine supersession (replaces Jaccard for embedded memories)
 - [x] Phase 2: Persistent embedding daemon (port 9876, auto-start, 30min idle shutdown)
 - [x] Phase 3: Knowledge graph (SQLite adjacency tables, entity extraction, BFS retrieval, cold-start bootstrap)
-- [ ] Phase 4: Nightly batch processor (async transcript scan)
-- [ ] Phase 5: Public skill installer (`/plugin install ensemble-memory`)
+- [x] Phase 4: Decision vault + retrieval quality (decisions table, BM25+RRF fusion, importance decay, near-dedup)
+- [ ] Phase 5: Contextual enrichment + cross-encoder reranking
+- [ ] Phase 6: Full ensemble + evolution
 
 ## Uninstall
 

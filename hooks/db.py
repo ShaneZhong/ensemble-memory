@@ -270,6 +270,25 @@ CREATE TABLE IF NOT EXISTS kg_sync_state (
 INSERT OR IGNORE INTO kg_sync_state VALUES
     ('last_claude_md_sync', '0', 0),
     ('last_memory_md_sync', '0', 0);
+
+-- Phase 4: Decision Vault (lean structured index over memories)
+CREATE TABLE IF NOT EXISTS decisions (
+    id                TEXT PRIMARY KEY,
+    memory_id         TEXT NOT NULL REFERENCES memories(id),
+    decision_type     TEXT NOT NULL
+                      CHECK(decision_type IN ('ARCHITECTURAL','PREFERENCE',
+                            'ERROR_RESOLUTION','CONSTRAINT','PATTERN')),
+    content_hash      TEXT NOT NULL,
+    keywords          TEXT,          -- JSON array
+    files_referenced  TEXT,          -- JSON array
+    project           TEXT NOT NULL,
+    session_id        TEXT NOT NULL,
+    created_at        REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_decisions_project ON decisions(project);
+CREATE INDEX IF NOT EXISTS idx_decisions_type ON decisions(decision_type);
+CREATE INDEX IF NOT EXISTS idx_decisions_content_hash ON decisions(content_hash);
+CREATE INDEX IF NOT EXISTS idx_decisions_memory_id ON decisions(memory_id);
 """
 
 # ── Connection ─────────────────────────────────────────────────────────────────
@@ -279,6 +298,45 @@ CREATE VIRTUAL TABLE IF NOT EXISTS kg_entities_fts USING fts5(
     name, aliases, description,
     content='kg_entities', content_rowid='rowid'
 );
+"""
+
+_DECISIONS_FTS_DDL = """
+CREATE VIRTUAL TABLE IF NOT EXISTS decisions_fts USING fts5(
+    text, keywords, decision_type,
+    content='decisions', content_rowid='rowid',
+    tokenize='porter ascii'
+);
+"""
+
+_DECISIONS_TRIGGERS_DDL = """
+CREATE TRIGGER IF NOT EXISTS decisions_ai AFTER INSERT ON decisions BEGIN
+    INSERT INTO decisions_fts(rowid, text, keywords, decision_type)
+    SELECT new.rowid,
+           (SELECT content FROM memories WHERE id = new.memory_id),
+           new.keywords,
+           new.decision_type;
+END;
+
+CREATE TRIGGER IF NOT EXISTS decisions_ad AFTER DELETE ON decisions BEGIN
+    INSERT INTO decisions_fts(decisions_fts, rowid, text, keywords, decision_type)
+    VALUES ('delete', old.rowid,
+            (SELECT content FROM memories WHERE id = old.memory_id),
+            old.keywords,
+            old.decision_type);
+END;
+
+CREATE TRIGGER IF NOT EXISTS decisions_au AFTER UPDATE ON decisions BEGIN
+    INSERT INTO decisions_fts(decisions_fts, rowid, text, keywords, decision_type)
+    VALUES ('delete', old.rowid,
+            (SELECT content FROM memories WHERE id = old.memory_id),
+            old.keywords,
+            old.decision_type);
+    INSERT INTO decisions_fts(rowid, text, keywords, decision_type)
+    SELECT new.rowid,
+           (SELECT content FROM memories WHERE id = new.memory_id),
+           new.keywords,
+           new.decision_type;
+END;
 """
 
 
@@ -292,6 +350,12 @@ def get_db() -> sqlite3.Connection:
         conn.executescript(_KG_FTS_DDL)
     except sqlite3.OperationalError:
         pass  # FTS5 not available or already exists
+    # Decisions FTS5 + triggers — Phase 4
+    try:
+        conn.executescript(_DECISIONS_FTS_DDL)
+        conn.executescript(_DECISIONS_TRIGGERS_DDL)
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
     return conn
 
@@ -448,6 +512,32 @@ def insert_memory(memory_dict: dict, session_id: str, project: str) -> str:
     if existing:
         conn.close()
         return existing["id"]
+
+    # Near-dedup: Jaccard similarity check against recent same-type memories
+    near_dupes = conn.execute(
+        """
+        SELECT id, content FROM memories
+        WHERE memory_type = ?
+          AND project = ?
+          AND superseded_by IS NULL
+          AND gc_eligible = 0
+          AND id != ?
+        ORDER BY created_at DESC
+        LIMIT 20
+        """,
+        (memory_type, project, ""),  # empty string won't match any UUID
+    ).fetchall()
+
+    for candidate in near_dupes:
+        if _jaccard_similarity(content, candidate["content"]) >= 0.85:
+            # Near-duplicate found — update access time instead of inserting
+            conn.execute(
+                "UPDATE memories SET last_accessed_at = ?, access_count = access_count + 1 WHERE id = ?",
+                (now, candidate["id"]),
+            )
+            conn.commit()
+            conn.close()
+            return candidate["id"]
 
     memory_id = str(uuid.uuid4())
     lambda_base = _lookup_lambda_base(conn, memory_type)
@@ -761,3 +851,128 @@ def get_reinforcement_count(trigger_condition: str) -> int:
     ).fetchone()
     conn.close()
     return row["cnt"] if row else 0
+
+
+def decay_stale_importance(days_threshold: int = 30, floor: int = 3) -> int:
+    """Decay importance by 1 for memories not accessed in `days_threshold` days.
+
+    Uses last_accessed_at if set, otherwise created_at. Floors at `floor`.
+    Returns the number of memories decayed.
+    """
+    conn = get_db()
+    now = time.time()
+    cutoff = now - (days_threshold * 86400)
+
+    cursor = conn.execute(
+        """
+        UPDATE memories
+        SET importance = importance - 1
+        WHERE importance > ?
+          AND superseded_by IS NULL
+          AND gc_eligible = 0
+          AND COALESCE(last_accessed_at, created_at) < ?
+        """,
+        (floor, cutoff),
+    )
+    count = cursor.rowcount
+    conn.commit()
+    conn.close()
+    return count
+
+
+_VALID_DECISION_TYPES = frozenset([
+    "ARCHITECTURAL", "PREFERENCE", "ERROR_RESOLUTION", "CONSTRAINT", "PATTERN"
+])
+
+
+def insert_decision(
+    memory_id: str,
+    decision_type: str,
+    content_hash: str,
+    keywords: Optional[list[str]] = None,
+    files_referenced: Optional[list[str]] = None,
+    project: str = "",
+    session_id: str = "",
+) -> Optional[str]:
+    """Insert a decision record linked to a memory. Returns decision id.
+
+    Skips if content_hash already exists (exact dedup). Normalizes
+    decision_type with fallback to None (skip insertion).
+    """
+    # Normalize decision_type
+    if decision_type not in _VALID_DECISION_TYPES:
+        for part in (decision_type or "").replace(",", "|").split("|"):
+            candidate = part.strip().upper()
+            if candidate in _VALID_DECISION_TYPES:
+                decision_type = candidate
+                break
+        else:
+            return None  # Not a valid decision — skip
+
+    conn = get_db()
+    now = time.time()
+
+    # Exact dedup
+    existing = conn.execute(
+        "SELECT id FROM decisions WHERE content_hash = ? AND project = ?",
+        (content_hash, project),
+    ).fetchone()
+    if existing:
+        conn.close()
+        return existing["id"]
+
+    decision_id = str(uuid.uuid4())
+    try:
+        conn.execute(
+            """
+            INSERT INTO decisions (
+                id, memory_id, decision_type, content_hash,
+                keywords, files_referenced, project, session_id, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                decision_id, memory_id, decision_type, content_hash,
+                json.dumps(keywords or []),
+                json.dumps(files_referenced or []),
+                project, session_id, now,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return decision_id
+
+
+def search_decisions_bm25(query: str, project: str = "", limit: int = 10) -> list[dict]:
+    """Search decisions using FTS5 BM25 ranking. Returns list of dicts."""
+    conn = get_db()
+    try:
+        project_clause = ""
+        params: list = [query]
+        if project:
+            project_clause = "AND d.project = ?"
+            params.append(project)
+        params.append(limit)
+
+        rows = conn.execute(
+            f"""
+            SELECT d.id, d.memory_id, d.decision_type, d.keywords,
+                   d.files_referenced, d.project, d.created_at,
+                   m.content, m.importance, m.memory_type,
+                   bm25(decisions_fts) AS bm25_score
+            FROM decisions_fts
+            JOIN decisions d ON d.rowid = decisions_fts.rowid
+            JOIN memories m ON m.id = d.memory_id
+            WHERE decisions_fts MATCH ?
+              {project_clause}
+            ORDER BY bm25(decisions_fts)
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+
+        return [dict(row) for row in rows]
+    except Exception:
+        return []
+    finally:
+        conn.close()
