@@ -35,7 +35,7 @@ PROMPTS_DIR = Path(
 MISSED_TURNS_FILE = ENSEMBLE_MEMORY_DIR / "logs" / "missed_turns.jsonl"
 STATS_FILE = ENSEMBLE_MEMORY_DIR / "logs" / "extraction_stats.jsonl"
 
-TIMEOUT_SECONDS = int(os.environ.get("ENSEMBLE_MEMORY_TIMEOUT", "30"))  # 30s default; full extraction takes 7-9s on M4 + cold load can add 2-5s
+TIMEOUT_SECONDS = int(os.environ.get("ENSEMBLE_MEMORY_TIMEOUT", "60"))  # 60s default; long turns can take 20-30s on M4
 TEMPERATURE = 0.2
 NUM_PREDICT = 1024
 

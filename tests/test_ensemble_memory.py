@@ -1648,6 +1648,55 @@ class TestPhase4Sprint1(TempDirMixin, unittest.TestCase):
         self.assertGreater(len(rows), 0)
         self.assertEqual(rows[0]["decision_type"], "ARCHITECTURAL")
 
+    def test_store_memory_decision_type_fallback(self):
+        """When LLM puts decision type in 'type' field, fallback should create a decision."""
+        try:
+            import store_memory
+        except ImportError:
+            self.skipTest("store_memory dependencies not available")
+
+        # Simulate qwen2.5:3b putting "PREFERENCE" in type instead of decision_type
+        memories = [{
+            "content": "Use msgpack for serialization not JSON",
+            "type": "PREFERENCE",
+            "importance": 6,
+            "subject": "serialization",
+            "predicate": "should_use",
+            "object": "msgpack",
+        }]
+        store_memory._store_to_sqlite(memories, "test-session-fallback")
+
+        conn = db.get_db()
+        rows = conn.execute(
+            "SELECT * FROM decisions WHERE decision_type = 'PREFERENCE'"
+        ).fetchall()
+        conn.close()
+        self.assertGreater(len(rows), 0, "Fallback should create a decision from type=PREFERENCE")
+        self.assertEqual(rows[0]["decision_type"], "PREFERENCE")
+
+    def test_store_memory_no_false_positive_decision(self):
+        """type='semantic' without decision_type should NOT create a decision row."""
+        try:
+            import store_memory
+        except ImportError:
+            self.skipTest("store_memory dependencies not available")
+
+        conn = db.get_db()
+        before = conn.execute("SELECT COUNT(*) as c FROM decisions").fetchone()["c"]
+        conn.close()
+
+        memories = [{
+            "content": "Python 3.11 is available in the venv",
+            "type": "semantic",
+            "importance": 5,
+        }]
+        store_memory._store_to_sqlite(memories, "test-session-no-decision")
+
+        conn = db.get_db()
+        after = conn.execute("SELECT COUNT(*) as c FROM decisions").fetchone()["c"]
+        conn.close()
+        self.assertEqual(before, after, "semantic memory without decision_type should not create a decision")
+
     def test_fts5_query_sanitization(self):
         """_sanitize_fts5_query should quote alphanumeric tokens and handle edge cases."""
         # Punctuation and quotes should be stripped, tokens quoted

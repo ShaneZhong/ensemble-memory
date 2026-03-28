@@ -11,7 +11,7 @@ conversation turn and extract important memories. Output ONLY valid JSON.
 {
   "memories": [
     {
-      "type": "correction | semantic | procedural",
+      "type": "correction | semantic | procedural (MUST be one of these three words, nothing else)",
       "content": "natural language description",
       "importance": 1-10 (corrections: min 7, decisions: min 6, facts: min 5),
       "confidence": 0.0-1.0 (1.0 = explicit user statement),
@@ -21,7 +21,7 @@ conversation turn and extract important memories. Output ONLY valid JSON.
       "rule": "for procedural: imperative rule statement, else null",
       "what_went_wrong": "for corrections: what went wrong, else null",
       "how_it_was_resolved": "for corrections: how it was fixed, else null",
-      "decision_type": "ARCHITECTURAL | PREFERENCE | ERROR_RESOLUTION | CONSTRAINT | PATTERN | null (only for decisions about tools, architecture, constraints, preferences)"
+      "decision_type": "ARCHITECTURAL | PREFERENCE | ERROR_RESOLUTION | CONSTRAINT | PATTERN | null (set this when the user makes a decision; type must STILL be correction/semantic/procedural)"
     }
   ],
   "entities": [

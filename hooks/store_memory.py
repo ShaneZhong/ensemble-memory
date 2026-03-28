@@ -116,7 +116,12 @@ def _store_to_sqlite(memories: list[dict], session_id: str) -> tuple[int, list[s
                 superseded_ids.append(superseded)
 
         # ── Decision vault write (if decision_type present) ──────────────────
+        # Fallback: if LLM put a decision type in "type" field instead of
+        # "decision_type", use it (qwen2.5:3b conflates the two fields)
+        _DECISION_TYPES = db._VALID_DECISION_TYPES
         decision_type = mem.get("decision_type")
+        if not decision_type and mem_type.upper() in _DECISION_TYPES:
+            decision_type = mem_type.upper()
         if decision_type:
             db.insert_decision(
                 memory_id=mem_id,
