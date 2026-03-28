@@ -382,6 +382,32 @@ def ensure_embedding_column():
 ensure_embedding_column()
 
 
+def ensure_enrichment_columns():
+    """Add enriched_text and enrichment_quality columns if missing (Phase 5 migration)."""
+    conn = get_db()
+    try:
+        conn.execute("SELECT enriched_text FROM memories LIMIT 1")
+    except sqlite3.OperationalError:
+        conn.execute("ALTER TABLE memories ADD COLUMN enriched_text TEXT")
+        conn.execute("ALTER TABLE memories ADD COLUMN enrichment_quality REAL DEFAULT 0.0")
+        conn.commit()
+    conn.close()
+
+
+ensure_enrichment_columns()
+
+
+def store_enrichment(memory_id: str, enriched_text: str, quality: float):
+    """Store enriched text and quality score for a memory."""
+    conn = get_db()
+    conn.execute(
+        "UPDATE memories SET enriched_text = ?, enrichment_quality = ? WHERE id = ?",
+        (enriched_text, quality, memory_id),
+    )
+    conn.commit()
+    conn.close()
+
+
 def store_embedding(memory_id: str, embedding: list[float]):
     """Store embedding vector for a memory."""
     conn = get_db()

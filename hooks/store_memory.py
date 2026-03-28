@@ -25,6 +25,7 @@ _HOOKS_DIR = Path(__file__).parent
 sys.path.insert(0, str(_HOOKS_DIR))
 
 import db
+import enrich
 import kg
 import write_log
 
@@ -49,7 +50,7 @@ def _notify_daemon_invalidate() -> None:
         pass  # Daemon may not be running — that's fine
 
 
-def _store_to_sqlite(memories: list[dict], session_id: str) -> tuple[int, list[str]]:
+def _store_to_sqlite(memories: list[dict], session_id: str, entities_raw: list[dict] = None) -> tuple[int, list[str]]:
     """Insert memories into SQLite, detect supersession and reinforcement.
 
     Returns (new_count, superseded_ids).
@@ -78,6 +79,8 @@ def _store_to_sqlite(memories: list[dict], session_id: str) -> tuple[int, list[s
 
         # ── Insert new memory ─────────────────────────────────────────────────
         content = mem.get("content", "")
+        importance = mem.get("importance", 5)
+        subject = mem.get("subject", "")
         mem_id = db.insert_memory(mem, session_id, PROJECT)
         new_count += 1
 
@@ -99,8 +102,43 @@ def _store_to_sqlite(memories: list[dict], session_id: str) -> tuple[int, list[s
         except Exception:
             pass  # Embeddings are best-effort
 
+        # ── Contextual enrichment (non-fatal, best-effort) ───────────────
+        if enrich.ENRICHMENT_ENABLED and importance >= enrich.MIN_ENRICHMENT_IMPORTANCE:
+            try:
+                entity_names = [
+                    e.get("name", "") for e in (entities_raw or [])
+                    if e.get("name", "")
+                ]
+                enriched = enrich.enrich_memory(
+                    content, mem_type, importance, entity_names, subject,
+                )
+                if enriched:
+                    db.store_enrichment(mem_id, enriched["text"], enriched["quality"])
+                    print(
+                        f"[store_memory] Enriched {mem_id[:8]} "
+                        f"(quality={enriched['quality']:.2f})",
+                        file=sys.stderr,
+                    )
+                    # Re-embed with enriched text
+                    try:
+                        epayload = json.dumps({"text": enriched["text"][:512]}).encode()
+                        ereq = urllib.request.Request(
+                            f"http://127.0.0.1:{DAEMON_PORT}/embed",
+                            data=epayload,
+                            headers={"Content-Type": "application/json"},
+                            method="POST",
+                        )
+                        with urllib.request.urlopen(ereq, timeout=1.0) as eresp:
+                            eresult = json.loads(eresp.read())
+                            new_emb = eresult.get("embedding")
+                        if new_emb:
+                            db.store_embedding(mem_id, new_emb)
+                    except Exception:
+                        pass  # Re-embed is best-effort
+            except Exception as exc:
+                print(f"[store_memory] Enrichment failed: {exc}", file=sys.stderr)
+
         # ── Supersession check (structured: subject+predicate match) ─────────
-        subject = mem.get("subject", "")
         predicate = mem.get("predicate", "")
         if subject and predicate:
             superseded = db.detect_supersession(mem_id, subject, predicate)
@@ -152,12 +190,15 @@ def main() -> None:
 
     memories = extraction.get("memories", [])
 
+    # Extract entities early so enrichment can use them during SQLite write
+    entities_raw = extraction.get("entities", [])
+
     # ── SQLite write (non-fatal) ──────────────────────────────────────────────
     new_count = 0
     superseded_ids: list[str] = []
     db_ok = True
     try:
-        new_count, superseded_ids = _store_to_sqlite(memories, session_id)
+        new_count, superseded_ids = _store_to_sqlite(memories, session_id, entities_raw)
     except Exception as exc:  # noqa: BLE001
         print(f"[store_memory] SQLite error (continuing): {exc}", file=sys.stderr)
         db_ok = False
@@ -175,7 +216,6 @@ def main() -> None:
         _notify_daemon_invalidate()
 
     # ── KG entity + relationship processing ───────────────────────────────────
-    entities_raw = extraction.get("entities", [])
     relationships_raw = extraction.get("relationships", [])
 
     if entities_raw or relationships_raw:

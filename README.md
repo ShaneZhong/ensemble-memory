@@ -231,7 +231,7 @@ ensemble-memory/
 python3 tests/test_ensemble_memory.py
 ```
 
-108 tests covering:
+145 tests covering:
 - Triage: 14 tests (all regex patterns, false positive rejection, case sensitivity, user-only scanning)
 - DB: 18 tests (CRUD, temporal scoring, supersession, dedup, reinforcement, confidence fields)
 - Write Log: 5 tests (file creation, format, dedup, empty memories)
@@ -243,6 +243,7 @@ python3 tests/test_ensemble_memory.py
 - Knowledge Graph: 26 tests (entity upsert/dedup/merge, relationship CRUD, predicate normalization, BFS traversal, FTS5 search, episode recording, bootstrap, extraction prompt format)
 - Daemon Embed Endpoints: 8 tests (/embed and /embed_batch happy path, error cases, model-unavailable 503)
 - Phase 4 Decision Vault: 12 tests (importance decay, near-dedup Jaccard, decision CRUD, BM25 search, type normalization, cross-project isolation)
+- Phase 5 Contextual Enrichment: 20 tests (validation, KG path, LLM path, batch enrichment, store_memory integration)
 
 ## Roadmap
 
@@ -254,7 +255,7 @@ python3 tests/test_ensemble_memory.py
 - [x] Phase 2: Persistent embedding daemon (port 9876, auto-start, 30min idle shutdown)
 - [x] Phase 3: Knowledge graph (SQLite adjacency tables, entity extraction, BFS retrieval, cold-start bootstrap)
 - [x] Phase 4: Decision vault + retrieval quality (decisions table, BM25+RRF fusion, importance decay, near-dedup)
-- [ ] Phase 5: Contextual enrichment + cross-encoder reranking
+- [x] Phase 5: Contextual enrichment (KG/LLM prefix generation, enriched embeddings, quality scoring)
 - [ ] Phase 6: Full ensemble + evolution
 
 ## Uninstall
