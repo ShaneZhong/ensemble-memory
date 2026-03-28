@@ -76,6 +76,7 @@ class TempDirMixin:
             else:
                 os.environ[k] = v
         db._DB_PATH_OVERRIDE = None
+        db._db_initialized.clear()
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
 
@@ -1534,6 +1535,134 @@ class TestPhase4Sprint1(TempDirMixin, unittest.TestCase):
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0]["decision_type"], "ARCHITECTURAL")
         self.assertIn("Redis", results[0]["content"])
+
+    def test_search_decisions_bm25_with_project_filter(self):
+        """BM25 search with project filter should only return decisions from that project."""
+        mem_id_test = db.insert_memory(
+            {"content": "Use Redis Stack for cache layer", "type": "semantic", "importance": 7},
+            "sess1", "/test/project",
+        )
+        db.insert_decision(
+            memory_id=mem_id_test,
+            decision_type="ARCHITECTURAL",
+            content_hash="proj_filter_hash_001",
+            keywords=["redis", "cache"],
+            project="/test/project",
+            session_id="sess1",
+        )
+
+        mem_id_other = db.insert_memory(
+            {"content": "Use Redis for other project cache", "type": "semantic", "importance": 7},
+            "sess1", "/other/project",
+        )
+        db.insert_decision(
+            memory_id=mem_id_other,
+            decision_type="ARCHITECTURAL",
+            content_hash="proj_filter_hash_002",
+            keywords=["redis", "cache"],
+            project="/other/project",
+            session_id="sess1",
+        )
+
+        results = db.search_decisions_bm25("redis", project="/test/project")
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["project"], "/test/project")
+
+    def test_search_decisions_bm25_no_matches(self):
+        """BM25 search for a term with no matches should return an empty list."""
+        results = db.search_decisions_bm25("nonexistent_term_xyz")
+        self.assertEqual(results, [])
+
+    def test_insert_decision_invalid_memory_id(self):
+        """insert_decision with a non-existent memory_id should raise IntegrityError (FK violation).
+
+        get_db() only applies PRAGMA foreign_keys when the DB path is first
+        initialized. Clearing _db_initialized forces a fresh connection that
+        re-runs the DDL (including PRAGMA foreign_keys = ON), making the FK
+        constraint active for this call.
+        """
+        # Force get_db() to re-run DDL so PRAGMA foreign_keys = ON is applied
+        db._db_initialized.clear()
+        with self.assertRaises(sqlite3.IntegrityError):
+            db.insert_decision(
+                memory_id="nonexistent-uuid",
+                decision_type="ARCHITECTURAL",
+                content_hash="test123",
+                project="/test",
+                session_id="sess1",
+            )
+
+    def test_decay_stale_importance_idempotency(self):
+        """decay_stale_importance should only run once per 23 hours (idempotency guard)."""
+        mem_id = db.insert_memory(
+            {"content": "Memory for idempotency test", "type": "semantic", "importance": 7},
+            "sess1", "/test/project",
+        )
+
+        past_time = time.time() - (40 * 86400)
+        conn = db.get_db()
+        conn.execute(
+            "UPDATE memories SET created_at = ?, last_accessed_at = NULL WHERE id = ?",
+            (past_time, mem_id),
+        )
+        conn.commit()
+        conn.close()
+
+        # First call should decay
+        count1 = db.decay_stale_importance()
+        self.assertEqual(count1, 1)
+
+        # Second call immediately after should be blocked by idempotency guard
+        count2 = db.decay_stale_importance()
+        self.assertEqual(count2, 0)
+
+        # Importance should be 6 (decremented once, not twice)
+        conn = db.get_db()
+        row = conn.execute("SELECT importance FROM memories WHERE id = ?", (mem_id,)).fetchone()
+        conn.close()
+        self.assertEqual(row["importance"], 6)
+
+    def test_store_memory_decision_write_path(self):
+        """_store_to_sqlite should create a decision row when decision_type is present."""
+        try:
+            import store_memory
+        except ImportError:
+            self.skipTest("store_memory dependencies not available")
+
+        memories = [{
+            "content": "Use SQLite for storage",
+            "type": "semantic",
+            "importance": 7,
+            "decision_type": "ARCHITECTURAL",
+            "subject": "database",
+            "predicate": "should_use",
+            "object": "SQLite",
+        }]
+        store_memory._store_to_sqlite(memories, "test-session")
+
+        conn = db.get_db()
+        rows = conn.execute(
+            "SELECT * FROM decisions WHERE decision_type = 'ARCHITECTURAL'"
+        ).fetchall()
+        conn.close()
+        self.assertGreater(len(rows), 0)
+        self.assertEqual(rows[0]["decision_type"], "ARCHITECTURAL")
+
+    def test_fts5_query_sanitization(self):
+        """_sanitize_fts5_query should quote alphanumeric tokens and handle edge cases."""
+        # Punctuation and quotes should be stripped, tokens quoted
+        result = db._sanitize_fts5_query("what's the \"config\"?")
+        self.assertIn('"what"', result)
+        self.assertIn('"s"', result)
+        self.assertIn('"the"', result)
+        self.assertIn('"config"', result)
+
+        # Empty string should return the empty FTS5 query
+        self.assertEqual(db._sanitize_fts5_query(""), '""')
+
+        # Normal query
+        result = db._sanitize_fts5_query("normal query")
+        self.assertEqual(result, '"normal" "query"')
 
     def test_decision_type_in_extraction_validation(self):
         """validate_extraction should return True when memories include a decision_type field."""

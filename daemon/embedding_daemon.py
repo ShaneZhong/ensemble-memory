@@ -278,12 +278,17 @@ def _bm25_search(query: str, project: str, limit: int = 20) -> list[dict]:
         return []
 
     results = []
+    conn = None
     try:
         conn = db.get_db()
 
         # 1. Search decisions via FTS5 BM25
         try:
-            params_d: list = [query]
+            import re
+            fts_tokens = re.findall(r'[a-zA-Z0-9_]+', query)
+            fts_query = " ".join(f'"{t}"' for t in fts_tokens) if fts_tokens else '""'
+
+            params_d: list = [fts_query]
             project_clause = ""
             if project:
                 project_clause = "AND d.project = ?"
@@ -314,7 +319,7 @@ def _bm25_search(query: str, project: str, limit: int = 20) -> list[dict]:
                     "source": "decisions_fts",
                 })
         except Exception:
-            pass  # decisions_fts may not exist yet
+            pass  # decisions_fts may not exist yet — graceful degradation
 
         # 2. Simple keyword search on memories as BM25 proxy
         # Use LIKE with keywords extracted from query
@@ -359,9 +364,11 @@ def _bm25_search(query: str, project: str, limit: int = 20) -> list[dict]:
                         "source": "memories_keyword",
                     })
 
-        conn.close()
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f"[daemon] BM25 search error: {exc}", flush=True)
+    finally:
+        if conn:
+            conn.close()
 
     return results
 
@@ -454,8 +461,6 @@ def _search(query: str, project: str) -> dict:
         return {"hits": [], "context": ""}
 
     _record_access([h["id"] for h in hits])
-    global _memories_cache
-    _memories_cache = []
 
     context_parts = [_format_context(hits)]
     kg_context = _get_kg_context(query)

@@ -40,10 +40,6 @@ def _db_path() -> Path:
 # ── DDL ───────────────────────────────────────────────────────────────────────
 
 _DDL = """
-PRAGMA journal_mode = WAL;
-PRAGMA synchronous = NORMAL;
-PRAGMA foreign_keys = ON;
-
 CREATE TABLE IF NOT EXISTS memories (
     id                    TEXT PRIMARY KEY,
     content               TEXT NOT NULL,
@@ -340,23 +336,35 @@ END;
 """
 
 
+_db_initialized: set[str] = set()
+
+
 def get_db() -> sqlite3.Connection:
     """Return a WAL-mode SQLite connection, creating tables on first run."""
-    conn = sqlite3.connect(str(_db_path()), check_same_thread=False)
+    db_path = str(_db_path())
+    conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
-    conn.executescript(_DDL)
-    # FTS5 virtual table — wrapped in try/except for safety
-    try:
-        conn.executescript(_KG_FTS_DDL)
-    except sqlite3.OperationalError:
-        pass  # FTS5 not available or already exists
-    # Decisions FTS5 + triggers — Phase 4
-    try:
-        conn.executescript(_DECISIONS_FTS_DDL)
-        conn.executescript(_DECISIONS_TRIGGERS_DDL)
-    except sqlite3.OperationalError:
-        pass
-    conn.commit()
+    # PRAGMAs are per-connection in SQLite — must run on every connection
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = NORMAL")
+    conn.execute("PRAGMA foreign_keys = ON")
+
+    if db_path not in _db_initialized:
+        conn.executescript(_DDL)
+        # FTS5 virtual table — wrapped in try/except for safety
+        try:
+            conn.executescript(_KG_FTS_DDL)
+        except sqlite3.OperationalError:
+            pass
+        # Decisions FTS5 + triggers — Phase 4
+        try:
+            conn.executescript(_DECISIONS_FTS_DDL)
+            conn.executescript(_DECISIONS_TRIGGERS_DDL)
+        except sqlite3.OperationalError:
+            pass
+        conn.commit()
+        _db_initialized.add(db_path)
+
     return conn
 
 
@@ -486,66 +494,64 @@ def insert_memory(memory_dict: dict, session_id: str, project: str) -> str:
         valid_to, decay_rate, stability, temporal_confidence
     """
     conn = get_db()
-    now = time.time()
-
-    content = memory_dict.get("content", "").strip()
-    raw_type = memory_dict.get("memory_type") or memory_dict.get("type", "episodic")
-
-    # Normalize memory_type: LLMs sometimes return "correction | semantic | procedural".
-    # Split on '|' and ',' and pick the first token that is a valid memory_type.
-    _VALID_MEMORY_TYPES = frozenset(["episodic", "semantic", "procedural", "correction"])
-    memory_type = "episodic"  # fallback default
-    for _part in (raw_type or "").replace(",", "|").split("|"):
-        _candidate = _part.strip().lower()
-        if _candidate in _VALID_MEMORY_TYPES:
-            memory_type = _candidate
-            break
-
-    importance = int(memory_dict.get("importance", 5))
-    content_hash = _content_hash(content)
-
-    # Skip exact duplicates within the same project
-    existing = conn.execute(
-        "SELECT id FROM memories WHERE content_hash = ? AND project = ? AND superseded_by IS NULL",
-        (content_hash, project),
-    ).fetchone()
-    if existing:
-        conn.close()
-        return existing["id"]
-
-    # Near-dedup: Jaccard similarity check against recent same-type memories
-    near_dupes = conn.execute(
-        """
-        SELECT id, content FROM memories
-        WHERE memory_type = ?
-          AND project = ?
-          AND superseded_by IS NULL
-          AND gc_eligible = 0
-          AND id != ?
-        ORDER BY created_at DESC
-        LIMIT 20
-        """,
-        (memory_type, project, ""),  # empty string won't match any UUID
-    ).fetchall()
-
-    for candidate in near_dupes:
-        if _jaccard_similarity(content, candidate["content"]) >= 0.85:
-            # Near-duplicate found — update access time instead of inserting
-            conn.execute(
-                "UPDATE memories SET last_accessed_at = ?, access_count = access_count + 1 WHERE id = ?",
-                (now, candidate["id"]),
-            )
-            conn.commit()
-            conn.close()
-            return candidate["id"]
-
-    memory_id = str(uuid.uuid4())
-    lambda_base = _lookup_lambda_base(conn, memory_type)
-    decay_rate = float(memory_dict.get("decay_rate", lambda_base))
-    stability = float(memory_dict.get("stability", _compute_stability(importance)))
-    gc_protected = 1 if importance >= 9 else 0
-
     try:
+        now = time.time()
+
+        content = memory_dict.get("content", "").strip()
+        raw_type = memory_dict.get("memory_type") or memory_dict.get("type", "episodic")
+
+        # Normalize memory_type: LLMs sometimes return "correction | semantic | procedural".
+        # Split on '|' and ',' and pick the first token that is a valid memory_type.
+        _VALID_MEMORY_TYPES = frozenset(["episodic", "semantic", "procedural", "correction"])
+        memory_type = "episodic"  # fallback default
+        for _part in (raw_type or "").replace(",", "|").split("|"):
+            _candidate = _part.strip().lower()
+            if _candidate in _VALID_MEMORY_TYPES:
+                memory_type = _candidate
+                break
+
+        importance = int(memory_dict.get("importance", 5))
+        content_hash = _content_hash(content)
+
+        # Skip exact duplicates within the same project
+        existing = conn.execute(
+            "SELECT id FROM memories WHERE content_hash = ? AND project = ? AND superseded_by IS NULL",
+            (content_hash, project),
+        ).fetchone()
+        if existing:
+            return existing["id"]
+
+        # Near-dedup: Jaccard similarity check against recent same-type memories
+        near_dupes = conn.execute(
+            """
+            SELECT id, content FROM memories
+            WHERE memory_type = ?
+              AND project = ?
+              AND superseded_by IS NULL
+              AND gc_eligible = 0
+              AND id != ?
+            ORDER BY created_at DESC
+            LIMIT 20
+            """,
+            (memory_type, project, ""),  # empty string won't match any UUID
+        ).fetchall()
+
+        for candidate in near_dupes:
+            if _jaccard_similarity(content, candidate["content"]) >= 0.85:
+                # Near-duplicate found — update access time instead of inserting
+                conn.execute(
+                    "UPDATE memories SET last_accessed_at = ?, access_count = access_count + 1 WHERE id = ?",
+                    (now, candidate["id"]),
+                )
+                conn.commit()
+                return candidate["id"]
+
+        memory_id = str(uuid.uuid4())
+        lambda_base = _lookup_lambda_base(conn, memory_type)
+        decay_rate = float(memory_dict.get("decay_rate", lambda_base))
+        stability = float(memory_dict.get("stability", _compute_stability(importance)))
+        gc_protected = 1 if importance >= 9 else 0
+
         conn.execute(
             """
             INSERT INTO memories (
@@ -595,9 +601,9 @@ def insert_memory(memory_dict: dict, session_id: str, project: str) -> str:
             ),
         )
         conn.commit()
+        return memory_id
     finally:
         conn.close()
-    return memory_id
 
 
 def detect_supersession(
@@ -858,9 +864,23 @@ def decay_stale_importance(days_threshold: int = 30, floor: int = 3) -> int:
 
     Uses last_accessed_at if set, otherwise created_at. Floors at `floor`.
     Returns the number of memories decayed.
+
+    Idempotency: only runs once per 23 hours to avoid repeated decay on
+    daemon restarts.
     """
     conn = get_db()
     now = time.time()
+
+    # Idempotency: only run once per 23 hours
+    last_run = conn.execute(
+        "SELECT value FROM kg_sync_state WHERE key = 'last_decay_run'"
+    ).fetchone()
+    if last_run:
+        last_ts = float(last_run["value"])
+        if (now - last_ts) < 82800:  # 23 hours in seconds
+            conn.close()
+            return 0
+
     cutoff = now - (days_threshold * 86400)
 
     cursor = conn.execute(
@@ -875,6 +895,12 @@ def decay_stale_importance(days_threshold: int = 30, floor: int = 3) -> int:
         (floor, cutoff),
     )
     count = cursor.rowcount
+
+    # Record this run
+    conn.execute(
+        "INSERT OR REPLACE INTO kg_sync_state (key, value, updated_at) VALUES ('last_decay_run', ?, ?)",
+        (str(now), now),
+    )
     conn.commit()
     conn.close()
     return count
@@ -943,12 +969,22 @@ def insert_decision(
     return decision_id
 
 
+def _sanitize_fts5_query(query: str) -> str:
+    """Escape FTS5 special characters by extracting alphanumeric tokens and quoting them."""
+    import re
+    tokens = re.findall(r'[a-zA-Z0-9_]+', query)
+    if not tokens:
+        return '""'
+    return " ".join(f'"{t}"' for t in tokens)
+
+
+# NOTE: Daemon _bm25_search has a similar FTS5 query. Keep them in sync.
 def search_decisions_bm25(query: str, project: str = "", limit: int = 10) -> list[dict]:
     """Search decisions using FTS5 BM25 ranking. Returns list of dicts."""
     conn = get_db()
     try:
         project_clause = ""
-        params: list = [query]
+        params: list = [_sanitize_fts5_query(query)]
         if project:
             project_clause = "AND d.project = ?"
             params.append(project)
