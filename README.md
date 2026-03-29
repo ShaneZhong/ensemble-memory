@@ -233,7 +233,7 @@ ensemble-memory/
 python3 tests/test_ensemble_memory.py
 ```
 
-145 tests covering:
+147 tests covering:
 - Triage: 14 tests (all regex patterns, false positive rejection, case sensitivity, user-only scanning)
 - DB: 18 tests (CRUD, temporal scoring, supersession, dedup, reinforcement, confidence fields)
 - Write Log: 5 tests (file creation, format, dedup, empty memories)

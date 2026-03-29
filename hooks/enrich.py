@@ -119,6 +119,14 @@ def _enrich_via_kg(
 
     try:
         import kg
+        import db as _db
+        # Cold-start guard: skip KG path if entity graph is too sparse
+        _cs_conn = _db.get_db()
+        entity_count = _cs_conn.execute("SELECT COUNT(*) FROM kg_entities").fetchone()[0]
+        _cs_conn.close()
+        if entity_count < 50:
+            return None  # Too few entities for meaningful context
+
         neighborhood = kg.kg_entity_neighborhood(entity_names[:5], max_depth=1, max_neighbors=3)
         formatted_prefix = neighborhood.get("formatted_prefix", "")
         if not formatted_prefix or len(formatted_prefix.strip()) < 10:
@@ -286,7 +294,9 @@ def enrich_batch(min_importance: int = 6, limit: int = 100, dry_run: bool = Fals
         if result and not dry_run:
             db.store_enrichment(mem_id, result["text"], result["quality"])
             enriched_count += 1
-            time.sleep(1.0)
+            # Only rate-limit LLM calls, not free KG enrichments
+            if result.get("quality", 0) < 0.8:  # KG path scores higher due to bonus
+                time.sleep(1.0)
         else:
             skipped_count += 1
 
