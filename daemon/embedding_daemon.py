@@ -17,7 +17,6 @@ Env vars:
 
 import json
 import logging
-import math
 import os
 import sys
 import threading
@@ -66,11 +65,11 @@ def _load_model() -> None:
         from sentence_transformers import SentenceTransformer
         _model = SentenceTransformer("all-MiniLM-L6-v2")
         _has_embeddings = True
-        print(f"[daemon] Embedding model loaded", flush=True)
+        logger.info("Embedding model loaded")
     except Exception as exc:
         _model = None
         _has_embeddings = False
-        print(f"[daemon] sentence-transformers unavailable ({exc}), using keyword fallback", flush=True)
+        logger.warning("sentence-transformers unavailable (%s), using keyword fallback", exc)
 
 
 def _get_embedding(text: str) -> list[float] | None:
@@ -84,12 +83,8 @@ def _get_embedding(text: str) -> list[float] | None:
 
 
 def _cosine_similarity(a: list[float], b: list[float]) -> float:
-    dot = sum(x * y for x, y in zip(a, b))
-    norm_a = math.sqrt(sum(x * x for x in a))
-    norm_b = math.sqrt(sum(y * y for y in b))
-    if norm_a == 0 or norm_b == 0:
-        return 0.0
-    return dot / (norm_a * norm_b)
+    from embeddings import cosine_similarity
+    return cosine_similarity(a, b)
 
 
 def _keyword_similarity(query: str, content: str) -> float:
@@ -384,7 +379,7 @@ def _bm25_search(query: str, project: str, limit: int = 20) -> list[dict]:
                     })
 
     except Exception as exc:
-        print(f"[daemon] BM25 search error: {exc}", flush=True)
+        logger.error("BM25 search error: %s", exc)
     finally:
         if conn:
             conn.close()
@@ -519,11 +514,13 @@ def _format_context(hits: list[dict]) -> str:
 # ── Background jobs ────────────────────────────────────────────────────────────
 
 _bg_timer = None
+_daemon_start_time: float = 0.0
+_last_bg_job_time: float | None = None
 
 
 def _run_background_jobs():
     """Run background maintenance jobs (serialized to prevent SQLite lock contention)."""
-    global _bg_timer
+    global _bg_timer, _last_bg_job_time
     try:
         import db
         import kg
@@ -585,13 +582,65 @@ def _run_background_jobs():
         except Exception as exc:
             logger.warning("[daemon] Relationship decay failed: %s", exc)
 
+        _last_bg_job_time = time.time()
     except Exception as exc:
         logger.warning("[daemon] Background job failed: %s", exc)
+        _last_bg_job_time = time.time()
 
     # Schedule next run in 6 hours
     _bg_timer = threading.Timer(21600, _run_background_jobs)
     _bg_timer.daemon = True
     _bg_timer.start()
+
+
+# ── Status builder ─────────────────────────────────────────────────────────────
+
+def _build_status() -> dict:
+    """Build status dict with daemon health metrics."""
+    import datetime
+
+    now = time.time()
+    status: dict = {
+        "status": "ok",
+        "port": PORT,
+        "model_loaded": _has_embeddings,
+        "memory_count": 0,
+        "cache_size": len(_memories_cache),
+        "cache_age_seconds": round(now - _cache_loaded_at, 1) if _cache_loaded_at else None,
+        "last_background_job": None,
+        "kg_entities": 0,
+        "kg_communities": 0,
+        "uptime_seconds": round(now - _daemon_start_time, 1) if _daemon_start_time else 0,
+    }
+
+    if _last_bg_job_time is not None:
+        status["last_background_job"] = (
+            datetime.datetime.fromtimestamp(_last_bg_job_time, tz=datetime.timezone.utc)
+            .isoformat()
+        )
+
+    try:
+        import db
+        conn = db.get_db()
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) AS cnt FROM memories WHERE superseded_by IS NULL AND gc_eligible = 0"
+            ).fetchone()
+            status["memory_count"] = row["cnt"] if row else 0
+
+            row = conn.execute("SELECT COUNT(*) AS cnt FROM kg_entities").fetchone()
+            status["kg_entities"] = row["cnt"] if row else 0
+
+            row = conn.execute(
+                "SELECT COUNT(DISTINCT community_id) AS cnt FROM kg_entities WHERE community_id IS NOT NULL"
+            ).fetchone()
+            status["kg_communities"] = row["cnt"] if row else 0
+        finally:
+            conn.close()
+    except Exception:
+        pass
+
+    return status
 
 
 # ── HTTP handler ───────────────────────────────────────────────────────────────
@@ -621,6 +670,8 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/health":
             self._send_json(200, {"status": "ok"})
+        elif self.path == "/status":
+            self._send_json(200, _build_status())
         else:
             self._send_json(404, {"error": "not found"})
 
@@ -703,7 +754,9 @@ class _Handler(BaseHTTPRequestHandler):
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    print(f"[daemon] Starting on port {PORT}", flush=True)
+    global _daemon_start_time
+    _daemon_start_time = time.time()
+    logger.info("Starting on port %d", PORT)
     _load_model()
 
     # Run importance decay on startup (cheap, ~1ms)
@@ -711,7 +764,7 @@ def main() -> None:
         import db
         decayed = db.decay_stale_importance(days_threshold=30, floor=3)
         if decayed:
-            print(f"[daemon] Decayed importance for {decayed} stale memories", flush=True)
+            logger.info("Decayed importance for %d stale memories", decayed)
     except Exception:
         pass
 
@@ -719,12 +772,12 @@ def main() -> None:
     _run_background_jobs()
 
     server = HTTPServer(("127.0.0.1", PORT), _Handler)
-    print(f"[daemon] Ready", flush=True)
+    logger.info("Ready")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
-    print(f"[daemon] Shutting down", flush=True)
+    logger.info("Shutting down")
 
 
 if __name__ == "__main__":

@@ -15,11 +15,12 @@ import urllib.request
 from pathlib import Path
 from typing import Optional
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("ensemble_memory.kg")
 
 _HOOKS_DIR = Path(__file__).parent
 sys.path.insert(0, str(_HOOKS_DIR))
 import db
+from embeddings import cosine_similarity as _cosine_similarity
 
 DAEMON_PORT = int(os.environ.get("ENSEMBLE_MEMORY_DAEMON_PORT", "9876"))
 
@@ -52,17 +53,6 @@ def _get_embedding_via_daemon(text: str) -> Optional[list]:
             return result.get("embedding")
     except Exception:
         return None
-
-
-def _cosine_similarity(a: list, b: list) -> float:
-    """Compute cosine similarity between two vectors."""
-    import math
-    dot = sum(x * y for x, y in zip(a, b))
-    norm_a = math.sqrt(sum(x * x for x in a))
-    norm_b = math.sqrt(sum(y * y for y in b))
-    if norm_a == 0 or norm_b == 0:
-        return 0.0
-    return dot / (norm_a * norm_b)
 
 
 def rebuild_fts5_index():
@@ -266,10 +256,7 @@ def insert_relationship(
         if normalized:
             predicate = normalized
         else:
-            print(
-                f"[kg] Invalid predicate '{predicate}', falling back to RELATED_TO",
-                file=sys.stderr,
-            )
+            logger.warning("Invalid predicate '%s', falling back to RELATED_TO", predicate)
             predicate = "RELATED_TO"
 
     # Auto-create entities as CONCEPT if they don't exist yet.
@@ -568,7 +555,7 @@ def record_episode(
             entity_id = upsert_entity(name, "CONCEPT", session_id=session_id)
             entity_ids.append(entity_id)
         except Exception as exc:
-            print(f"[kg] record_episode entity error ({name}): {exc}", file=sys.stderr)
+            logger.error("record_episode entity error (%s): %s", name, exc)
 
     # Link entities to episode in a fresh connection
     if entity_ids:
@@ -580,7 +567,7 @@ def record_episode(
                     (entity_id, episode_id),
                 )
             except Exception as exc:
-                print(f"[kg] record_episode link error ({entity_id}): {exc}", file=sys.stderr)
+                logger.error("record_episode link error (%s): %s", entity_id, exc)
         conn.commit()
         conn.close()
 
@@ -605,13 +592,13 @@ def bootstrap_from_files(file_paths: list) -> dict:
     for file_path in file_paths:
         path = Path(file_path)
         if not path.exists():
-            print(f"[kg] bootstrap: file not found: {file_path}", file=sys.stderr)
+            logger.warning("bootstrap: file not found: %s", file_path)
             continue
 
         try:
             content = path.read_text(encoding="utf-8", errors="replace")
         except Exception as exc:
-            print(f"[kg] bootstrap: error reading {file_path}: {exc}", file=sys.stderr)
+            logger.error("bootstrap: error reading %s: %s", file_path, exc)
             continue
 
         # Chunk content to stay within model context and timeout limits
@@ -660,10 +647,7 @@ def bootstrap_from_files(file_paths: list) -> dict:
                 response = json.loads(body)
                 extracted = json.loads(response.get("response", "{}"))
             except Exception as exc:
-                print(
-                    f"[kg] bootstrap: Ollama error for {file_path} chunk {chunk_idx + 1}: {exc}",
-                    file=sys.stderr,
-                )
+                logger.error("bootstrap: Ollama error for %s chunk %d: %s", file_path, chunk_idx + 1, exc)
                 continue
 
             for ent in extracted.get("entities", []):
@@ -678,7 +662,7 @@ def bootstrap_from_files(file_paths: list) -> dict:
                     )
                     entities_created += 1
                 except Exception as exc:
-                    print(f"[kg] bootstrap entity error ({name}): {exc}", file=sys.stderr)
+                    logger.error("bootstrap entity error (%s): %s", name, exc)
 
             for rel in extracted.get("relationships", []):
                 subject = (rel.get("subject") or "").strip()
@@ -697,7 +681,7 @@ def bootstrap_from_files(file_paths: list) -> dict:
                     if result:
                         relationships_created += 1
                 except Exception as exc:
-                    print(f"[kg] bootstrap rel error ({subject}-{predicate}-{obj}): {exc}", file=sys.stderr)
+                    logger.error("bootstrap rel error (%s-%s-%s): %s", subject, predicate, obj, exc)
 
     # Update kg_sync_state timestamps
     conn = db.get_db()

@@ -8,11 +8,14 @@ Env vars:
     ENSEMBLE_MEMORY_EMBED_MODEL   Model name (default: all-MiniLM-L6-v2)
 """
 
+import logging
 import math
 import os
 import sys
 import warnings
 from typing import Optional
+
+logger = logging.getLogger("ensemble_memory.embeddings")
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
@@ -25,10 +28,8 @@ try:
     _AVAILABLE = True
 except ImportError:
     _AVAILABLE = False
-    print(
-        "[embeddings] sentence-transformers not installed. "
-        "Run: pip install sentence-transformers",
-        file=sys.stderr,
+    logger.info(
+        "sentence-transformers not installed. Run: pip install sentence-transformers"
     )
 
 # ── Lazy model cache ──────────────────────────────────────────────────────────
@@ -111,20 +112,21 @@ def setup_embeddings() -> None:
     subprocess.check_call(
         [sys.executable, "-m", "pip", "install", "sentence-transformers"]
     )
-    print("[embeddings] sentence-transformers installed. Restart your process to use it.")
+    logger.info("sentence-transformers installed. Restart your process to use it.")
 
 
 # ── Smoke test ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
     if not _AVAILABLE:
-        print("Run setup_embeddings() or: pip install sentence-transformers")
+        logger.error("Run setup_embeddings() or: pip install sentence-transformers")
         sys.exit(1)
 
-    print(f"[embeddings] Loading model: {MODEL_NAME}")
+    logger.info("Loading model: %s", MODEL_NAME)
     vec = get_embedding("hello world")
-    print(f"[embeddings] Embedding dim: {len(vec)}")
-    print(f"[embeddings] First 8 values: {[round(v, 4) for v in vec[:8]]}")
+    logger.info("Embedding dim: %d", len(vec))
+    logger.info("First 8 values: %s", [round(v, 4) for v in vec[:8]])
 
     sim = cosine_similarity(vec, vec)
-    print(f"[embeddings] Self-similarity: {sim:.6f}")
+    logger.info("Self-similarity: %.6f", sim)

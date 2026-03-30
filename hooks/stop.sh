@@ -19,6 +19,10 @@ HOOKS_DIR="${ENSEMBLE_MEMORY_HOME}/hooks"
 # ── Python: use ENSEMBLE_MEMORY_PYTHON if set, else find python3 ──────────────
 PYTHON3="${ENSEMBLE_MEMORY_PYTHON:-$(command -v python3)}"
 
+# ── Debug log ──────────────────────────────────────────────────────────────────
+DEBUG_LOG="${ENSEMBLE_MEMORY_DIR:-$HOME/.ensemble_memory}/logs/stop_debug.log"
+mkdir -p "$(dirname "$DEBUG_LOG")"
+
 # ── Temp file cleanup ─────────────────────────────────────────────────────────
 TURN_FILE=""
 cleanup() {
@@ -161,7 +165,7 @@ with open(sys.argv[2], 'w') as f:
 " "$TURN_FILE" "$USER_ONLY_FILE"
 
 # ── Triage: check for correction/decision signals (user text only) ───────────
-SIGNALS="$("$PYTHON3" "${HOOKS_DIR}/triage.py" "$USER_ONLY_FILE" 2>/dev/null || echo "[]")"
+SIGNALS="$("$PYTHON3" "${HOOKS_DIR}/triage.py" "$USER_ONLY_FILE" 2>>"$DEBUG_LOG" || echo "[]")"
 
 # Fast path: no signals found
 if [[ "$SIGNALS" == "[]" || -z "$SIGNALS" ]]; then
@@ -169,7 +173,7 @@ if [[ "$SIGNALS" == "[]" || -z "$SIGNALS" ]]; then
 fi
 
 # ── Extract memories via Ollama ───────────────────────────────────────────────
-EXTRACTION="$("$PYTHON3" "${HOOKS_DIR}/extract.py" "$TURN_FILE" "$SIGNALS" 2>/dev/null || echo "")"
+EXTRACTION="$("$PYTHON3" "${HOOKS_DIR}/extract.py" "$TURN_FILE" "$SIGNALS" 2>>"$DEBUG_LOG" || echo "")"
 
 if [[ -z "$EXTRACTION" || "$EXTRACTION" == "null" ]]; then
     exit 0
@@ -177,4 +181,4 @@ fi
 
 # ── Write to SQLite + daily memory log ───────────────────────────────────────
 export TRANSCRIPT_PATH
-"$PYTHON3" "${HOOKS_DIR}/store_memory.py" "$EXTRACTION" "$SESSION_ID" 2>/dev/null || true
+"$PYTHON3" "${HOOKS_DIR}/store_memory.py" "$EXTRACTION" "$SESSION_ID" 2>>"$DEBUG_LOG" || true

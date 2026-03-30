@@ -20,6 +20,10 @@ HOOKS_DIR="${ENSEMBLE_MEMORY_HOME}/hooks"
 # ── Python: use ENSEMBLE_MEMORY_PYTHON if set, else find python3 ──────────────
 PYTHON3="${ENSEMBLE_MEMORY_PYTHON:-$(command -v python3)}"
 
+# ── Debug log ──────────────────────────────────────────────────────────────────
+DEBUG_LOG="${ENSEMBLE_MEMORY_DIR:-$HOME/.ensemble_memory}/logs/session_end_debug.log"
+mkdir -p "$(dirname "$DEBUG_LOG")"
+
 # ── Temp file cleanup ─────────────────────────────────────────────────────────
 FULL_TRANSCRIPT_FILE=""
 FILTERED_EXTRACTION_FILE=""
@@ -110,7 +114,7 @@ fi
 
 # ── Extract memories from the full session (no triage gate) ──────────────────
 # Pass empty signals array — we want the LLM to scan everything.
-EXTRACTION="$("$PYTHON3" "${HOOKS_DIR}/extract.py" "$FULL_TRANSCRIPT_FILE" "[]" 2>/dev/null || echo "")"
+EXTRACTION="$("$PYTHON3" "${HOOKS_DIR}/extract.py" "$FULL_TRANSCRIPT_FILE" "[]" 2>>"$DEBUG_LOG" || echo "")"
 
 if [[ -z "$EXTRACTION" || "$EXTRACTION" == "null" ]]; then
     exit 0
@@ -177,7 +181,7 @@ FILTERED_EXTRACTION="$(cat "$FILTERED_EXTRACTION_FILE")"
 # Check if any new memories remain
 HAS_MEMORIES="$("$PYTHON3" -c \
     "import json,sys; d=json.loads(sys.argv[1]); print('yes' if d.get('memories') else 'no')" \
-    "$FILTERED_EXTRACTION" 2>/dev/null || echo "no")"
+    "$FILTERED_EXTRACTION" 2>>"$DEBUG_LOG" || echo "no")"
 
 if [[ "$HAS_MEMORIES" != "yes" ]]; then
     exit 0
@@ -185,4 +189,4 @@ fi
 
 # ── Write new memories to the daily log ──────────────────────────────────────
 export TRANSCRIPT_PATH
-"$PYTHON3" "${HOOKS_DIR}/write_log.py" "$FILTERED_EXTRACTION" "$SESSION_ID" 2>/dev/null || true
+"$PYTHON3" "${HOOKS_DIR}/write_log.py" "$FILTERED_EXTRACTION" "$SESSION_ID" 2>>"$DEBUG_LOG" || true

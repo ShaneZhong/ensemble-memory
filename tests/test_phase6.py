@@ -2834,3 +2834,105 @@ class TestE2ERobustness:
             conn.close()
 
         assert row is not None, "Content with special chars should be stored"
+
+
+class TestTriageRecall:
+    """Test triage catches common memory-worthy phrasings."""
+
+    def test_new_correction_patterns(self):
+        """Test all new TIER1 patterns with should-pass cases."""
+        import triage
+
+        cases = [
+            ("make sure to always use 4 spaces", "correction"),
+            ("make sure to run the linter before committing", "correction"),
+            ("the correct way is to import at the top", "correction"),
+            ("the right way is to use context managers", "correction"),
+            ("please don't commit .env files", "correction"),
+            ("please do not use global state", "correction"),
+            ("the correct approach is to mock the dependency", "correction"),
+            ("the better approach is to use fixtures", "correction"),
+            ("important: always pin your dependencies", "correction"),
+            ("note: never use wildcards in imports", "correction"),
+            ("rule: don't commit secrets", "correction"),
+            ("do pytest instead of unittest", "correction"),
+        ]
+
+        for text, expected_type in cases:
+            signals = triage.triage(text)
+            matched_types = [s["type"] for s in signals]
+            assert expected_type in matched_types, (
+                f"Expected '{expected_type}' for: '{text}', got: {signals}"
+            )
+
+    def test_new_preference_patterns(self):
+        """Test all new TIER3 patterns."""
+        import triage
+
+        cases = [
+            ("I prefer tabs over spaces", "preference"),
+            ("we prefer to use black for formatting", "preference"),
+        ]
+
+        for text, expected_type in cases:
+            signals = triage.triage(text)
+            matched_types = [s["type"] for s in signals]
+            assert expected_type in matched_types, (
+                f"Expected '{expected_type}' for: '{text}', got: {signals}"
+            )
+
+    def test_new_decision_patterns(self):
+        """Test all new TIER4 patterns."""
+        import triage
+
+        cases = [
+            ("the convention is to use snake_case", "decision"),
+            ("our convention is 4-space indentation", "decision"),
+            ("you should always use the venv python", "decision"),
+            ("you should never commit directly to main", "decision"),
+        ]
+
+        for text, expected_type in cases:
+            signals = triage.triage(text)
+            matched_types = [s["type"] for s in signals]
+            assert expected_type in matched_types, (
+                f"Expected '{expected_type}' for: '{text}', got: {signals}"
+            )
+
+    def test_false_positive_rejection(self):
+        """Test that common non-memory-worthy phrases don't trigger.
+
+        These include the reviewer's explicit false positive test cases
+        plus ordinary coding requests and questions.
+        """
+        import triage
+
+        false_positives = [
+            # Reviewer-specified false positives
+            "you should see the output",
+            "please use the read tool",
+            "switch to the other branch",
+            "make sure the tests pass",
+            "note: I'll be back in 5 min",
+            # Ordinary requests
+            "can you read the file?",
+            "can you fix the bug in main.py?",
+            "I think we should refactor this later",
+            "I think it might work",
+            "try running it again",
+            "try the other endpoint",
+            "what do you think about Redis?",
+            "how does this function work?",
+            "show me the logs from yesterday",
+            "list all the files in src/",
+            "read the README and summarize it",
+            "explain what this decorator does",
+            "write a function that parses JSON",
+            "create a new file called utils.py",
+        ]
+
+        for text in false_positives:
+            signals = triage.triage(text)
+            assert len(signals) == 0, (
+                f"False positive on: '{text}' — matched: {signals}"
+            )

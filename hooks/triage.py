@@ -20,6 +20,17 @@ TIER1_CORRECTION = [
     r"(?:^|\n|[.!]\s+)always\s+(use|do|add|run|prefer|set|ensure)\b",
     r"\buse\s+\S+[,.]?\s+not\s+\S+",
     r"\bnot\s+\S+[,.]\s+use\s+\S+",
+    # --- new patterns for recall improvement ---
+    r"\bmake sure\s+(to\s+)?(always|never|use|run|set|add|check)\b",
+    r"\bthe\s+(correct|right)\s+way\s+is\b",
+    r"\bplease\s+(don'?t|do not)\s+(use|commit|add|push|deploy|merge|run)\b",
+    r"\b(correct|better)\s+approach\s+is\b",
+    r"(?:^|\n)\s*(?:important|note|rule)\s*:\s*(always|never|use|don't|do not|must)",
+    r"\bdo\s+\S+\s+instead\s+of\b",
+]
+
+TIER3_PREFERENCE = [
+    r"\b(I|we)\s+prefer\b",
 ]
 
 TIER4_DECISION = [
@@ -30,10 +41,14 @@ TIER4_DECISION = [
     r"\bfrom now on[,.]?\s+(use|do|always)",
     r"\bgoing forward[,.]?\s+(use|do|always|we)",
     r"\bremember[,.]?\s+(always|never|use|don't)",
+    # --- new patterns for recall improvement ---
+    r"\b(the|our)\s+convention\s+is\b",
+    r"\byou\s+should\s+(always|never|use|prefer|avoid|run|set)\b",
 ]
 
 SIGNALS = [
     (1, "correction", TIER1_CORRECTION),
+    (3, "preference", TIER3_PREFERENCE),
     (4, "decision", TIER4_DECISION),
 ]
 
