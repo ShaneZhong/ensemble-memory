@@ -16,12 +16,16 @@ Env vars:
 """
 
 import json
+import logging
 import math
 import os
 import sys
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+
+logger = logging.getLogger("ensemble_memory.daemon")
 
 # ── Locate hooks dir and make siblings importable ─────────────────────────────
 _DAEMON_DIR = Path(__file__).resolve().parent
@@ -103,23 +107,15 @@ def _keyword_similarity(query: str, content: str) -> float:
 
 
 def _temporal_score(row: dict) -> float:
-    now = time.time()
-    last = row.get("last_accessed_at") or row.get("created_at", now)
-    t_days = max((now - last) / 86400.0, 1e-6)
-
-    stability  = float(row.get("stability", 0.0))
-    decay_rate = float(row.get("decay_rate", 0.16))
-    lambda_eff = decay_rate * (1.0 - stability * 0.8)
-    strength   = math.exp(-lambda_eff * t_days)
-
-    access_count = int(row.get("access_count", 0))
-    if access_count == 0:
-        return strength * 0.5
-
-    d    = 0.5
-    actr = math.log(access_count / (1.0 - d)) - d * math.log(t_days)
-    actr_norm = max(0.0, min(1.0, (actr + 5.0) / 10.0))
-    return actr_norm * 0.5 + strength * 0.5
+    """Compute temporal score using canonical formula from db module."""
+    import db
+    return db.temporal_score(
+        access_count=int(row.get("access_count", 0)),
+        last_accessed_at=row.get("last_accessed_at"),
+        created_at=row.get("created_at", time.time()),
+        decay_rate=float(row.get("decay_rate", 0.16)),
+        stability=float(row.get("stability", 0.0)),
+    )
 
 
 def _load_memories(project: str) -> list[dict]:
@@ -149,11 +145,14 @@ def _load_memories(project: str) -> list[dict]:
         params.extend([project, project, project])
 
     try:
+        # Phase 6: superseded_by IS NULL AND gc_eligible = 0 filters ensure
+        # superseded and garbage-collected memories are excluded from retrieval.
         rows = conn.execute(
             f"""
             SELECT id, content, memory_type, importance, subject,
                    access_count, last_accessed_at, created_at,
-                   decay_rate, stability, embedding
+                   decay_rate, stability, embedding,
+                   temporal_score, score_computed_at
             FROM memories
             WHERE superseded_by IS NULL
               AND gc_eligible = 0
@@ -260,6 +259,26 @@ def _get_kg_context(query_text: str) -> str:
 
         entity_names = [e["name"] for e in entities[:5]]
         neighborhood = kg.kg_entity_neighborhood(entity_names, max_depth=2, max_neighbors=3)
+
+        # Community-aware soft preference: sort neighborhood entities so that
+        # entities sharing a community with any query entity come first.
+        nb_entities = neighborhood.get("entities", [])
+        if nb_entities:
+            query_community_ids = set()
+            for e in entities[:5]:
+                cid = e.get("community_id")
+                if cid is not None:
+                    query_community_ids.add(cid)
+
+            if query_community_ids:
+                nb_entities.sort(
+                    key=lambda ent: (
+                        0 if ent.get("community_id") in query_community_ids else 1,
+                        ent.get("name", ""),
+                    )
+                )
+                neighborhood["entities"] = nb_entities
+
         return neighborhood.get("formatted_prefix", "")
     except Exception:
         return ""
@@ -386,7 +405,17 @@ def _search(query: str, project: str) -> dict:
     for mem in memories:
         if mem.get("memory_type") not in RETRIEVABLE_TYPES:
             continue
-        t_score = _temporal_score(mem)
+        # Use cached temporal_score if computed within 6 hours
+        _CACHE_FRESHNESS = 21600  # 6 hours in seconds
+        cached_score = mem.get("temporal_score")
+        computed_at = mem.get("score_computed_at")
+        now = time.time()
+        if (cached_score is not None
+                and computed_at is not None
+                and (now - computed_at) < _CACHE_FRESHNESS):
+            t_score = cached_score
+        else:
+            t_score = _temporal_score(mem)
         if t_score < MIN_TEMPORAL_SCORE:
             continue
 
@@ -485,6 +514,84 @@ def _format_context(hits: list[dict]) -> str:
         lines.append(f"- **[{label}]** {content}")
     lines.append("")
     return "\n".join(lines)
+
+
+# ── Background jobs ────────────────────────────────────────────────────────────
+
+_bg_timer = None
+
+
+def _run_background_jobs():
+    """Run background maintenance jobs (serialized to prevent SQLite lock contention)."""
+    global _bg_timer
+    try:
+        import db
+        import kg
+
+        # 1. Temporal score batch computation
+        count = db.compute_temporal_scores()
+        if count > 0:
+            logger.info("[daemon] Computed temporal scores for %d memories", count)
+
+        # 2. Process supersession events
+        event_stats = db.process_supersession_events()
+        if event_stats['processed'] > 0:
+            logger.info("[daemon] Processed %d supersession events", event_stats['processed'])
+
+        # 3. Enforce chain depth limits
+        chain_marked = db.enforce_chain_depth_limits()
+        if chain_marked > 0:
+            logger.info("[daemon] Chain pruning marked %d memories as gc_eligible", chain_marked)
+
+        # 4. Garbage collection
+        gc_stats = db.run_garbage_collection()
+        if gc_stats['total'] > 0:
+            logger.info("[daemon] GC: %d forgotten", gc_stats['gc_forgotten'])
+
+        # 5. Promotion scan (check for memories eligible for CLAUDE.md promotion)
+        try:
+            import promote
+            conn = db.get_db()
+            try:
+                candidates = conn.execute("""
+                    SELECT id FROM memories
+                    WHERE promotion_candidate = 1
+                      AND reinforcement_count >= 5
+                      AND memory_type = 'procedural'
+                      AND superseded_by IS NULL
+                      AND gc_eligible = 0
+                """).fetchall()
+            finally:
+                conn.close()
+            for candidate in candidates:
+                promote.check_and_promote(candidate["id"])
+        except Exception as exc:
+            logger.warning("[daemon] Promotion scan failed: %s", exc)
+
+        # 6. Community detection
+        try:
+            communities = kg.detect_communities()
+            if communities > 0:
+                logger.info("[daemon] Detected %d communities", communities)
+        except Exception as exc:
+            logger.warning("[daemon] Community detection failed: %s", exc)
+
+        # 7. Relationship decay
+        try:
+            decay_stats = kg.apply_relationship_decay()
+            if decay_stats['decayed'] > 0 or decay_stats['expired'] > 0:
+                logger.info("[daemon] Relationship decay: %d decayed, %d expired",
+                           decay_stats['decayed'], decay_stats['expired'])
+        except Exception as exc:
+            logger.warning("[daemon] Relationship decay failed: %s", exc)
+
+    except Exception as exc:
+        logger.warning("[daemon] Background job failed: %s", exc)
+
+    # Schedule next run in 6 hours
+    _bg_timer = threading.Timer(21600, _run_background_jobs)
+    _bg_timer.daemon = True
+    _bg_timer.start()
 
 
 # ── HTTP handler ───────────────────────────────────────────────────────────────
@@ -607,6 +714,9 @@ def main() -> None:
             print(f"[daemon] Decayed importance for {decayed} stale memories", flush=True)
     except Exception:
         pass
+
+    # Start background temporal score computation
+    _run_background_jobs()
 
     server = HTTPServer(("127.0.0.1", PORT), _Handler)
     print(f"[daemon] Ready", flush=True)

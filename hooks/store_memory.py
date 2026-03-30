@@ -64,26 +64,39 @@ def _store_to_sqlite(memories: list[dict], session_id: str, entities_raw: list[d
 
     for mem in memories:
         mem_type = mem.get("type", "")
-        trigger = mem.get("trigger_condition", "")
 
-        # ── Reinforcement check (procedural only) ─────────────────────────────
-        existing_id = None
-        if mem_type == "procedural" and trigger:
-            count = db.get_reinforcement_count(trigger)
-            if count > 0:
-                # Reinforcement exists; skip inserting a duplicate
-                if count >= PROMOTION_THRESHOLD:
-                    print(
-                        f"[store_memory] PROMOTION CANDIDATE: procedural memory "
-                        f"'{trigger[:60]}' reinforced {count}x",
-                        file=sys.stderr,
-                    )
-                continue  # don't insert a new row
-
-        # ── Insert new memory ─────────────────────────────────────────────────
         content = mem.get("content", "")
         importance = mem.get("importance", 5)
         subject = mem.get("subject", "")
+        predicate_val = mem.get("predicate", "")
+        obj_val = mem.get("object", "")
+
+        # ── Reinforcement check (procedural + correction) ────────────────────
+        # Uses structured triples first (most reliable), then embedding cosine
+        # similarity, then LIKE substring fallback.
+        # Runs BEFORE insert: if reinforced, skip inserting a duplicate.
+        if mem_type in ("procedural", "correction"):
+            match_text = mem.get("rule", "") or content
+            try:
+                count, existing_id = db.get_reinforcement_match(
+                    match_text=match_text,
+                    subject=subject,
+                    predicate=predicate_val,
+                    obj=obj_val,
+                )
+                if count > 0 and existing_id:
+                    reinforced_count = db.increment_reinforcement(existing_id)
+                    if reinforced_count >= PROMOTION_THRESHOLD:
+                        logger.info(
+                            "[store_memory] PROMOTION CANDIDATE: memory "
+                            "'%s' reinforced %dx",
+                            match_text[:60], reinforced_count,
+                        )
+                    continue  # don't insert a new row
+            except Exception as exc:
+                logger.warning("[store_memory] Reinforcement check failed: %s", exc)
+
+        # ── Insert new memory ─────────────────────────────────────────────────
         mem_id = db.insert_memory(mem, session_id, PROJECT)
         new_count += 1
 
@@ -142,14 +155,13 @@ def _store_to_sqlite(memories: list[dict], session_id: str, entities_raw: list[d
                 logger.warning("[store_memory] Enrichment failed: %s", exc)
 
         # ── Supersession check (structured: subject+predicate match) ─────────
-        predicate = mem.get("predicate", "")
-        if subject and predicate:
-            superseded = db.detect_supersession(mem_id, subject, predicate)
+        if subject and predicate_val:
+            superseded = db.detect_supersession(mem_id, subject, predicate_val)
             if superseded:
                 superseded_ids.append(superseded)
 
         # ── Content-similarity supersession (fallback when no structured triple) ─
-        if not subject or not predicate:
+        if not subject or not predicate_val:
             superseded = db.detect_content_supersession(
                 mem_id, content, mem_type, threshold=0.6, new_embedding=embedding
             )
@@ -188,7 +200,7 @@ def main() -> None:
     try:
         extraction = json.loads(extraction_raw)
     except json.JSONDecodeError as exc:
-        print(f"[store_memory] invalid JSON: {exc}", file=sys.stderr)
+        logger.error("[store_memory] invalid JSON: %s", exc)
         sys.exit(1)
 
     memories = extraction.get("memories", [])
@@ -203,7 +215,7 @@ def main() -> None:
     try:
         new_count, superseded_ids = _store_to_sqlite(memories, session_id, entities_raw)
     except Exception as exc:  # noqa: BLE001
-        print(f"[store_memory] SQLite error (continuing): {exc}", file=sys.stderr)
+        logger.warning("[store_memory] SQLite error (continuing): %s", exc)
         db_ok = False
 
     # ── Debug summary ─────────────────────────────────────────────────────────
@@ -211,9 +223,9 @@ def main() -> None:
         parts = [f"{new_count} new"]
         if superseded_ids:
             parts.append(f"{len(superseded_ids)} superseded " + " ".join(superseded_ids))
-        print(
-            f"[store_memory] Stored {len(memories)} memories ({', '.join(parts)})",
-            file=sys.stderr,
+        logger.info(
+            "[store_memory] Stored %d memories (%s)",
+            len(memories), ", ".join(parts),
         )
         # Notify daemon so it reloads its memory cache on next /search
         _notify_daemon_invalidate()
@@ -256,13 +268,12 @@ def main() -> None:
                     episode_id=episode_id,
                 )
 
-            print(
-                f"[store_memory] KG: {len(entity_ids)} entities, "
-                f"{len(relationships_raw)} relationships",
-                file=sys.stderr,
+            logger.info(
+                "[store_memory] KG: %d entities, %d relationships",
+                len(entity_ids), len(relationships_raw),
             )
         except Exception as exc:
-            print(f"[store_memory] KG error (continuing): {exc}", file=sys.stderr)
+            logger.warning("[store_memory] KG error (continuing): %s", exc)
 
     # ── Markdown write (always runs) ──────────────────────────────────────────
     # Delegate to write_log.main() by temporarily patching sys.argv so it sees

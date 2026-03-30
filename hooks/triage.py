@@ -16,6 +16,10 @@ TIER1_CORRECTION = [
     r"\bstop\s+(doing|using|adding)",
     r"\bthat'?s\s+(wrong|incorrect|not right)",
     r"\binstead[,.]?\s+(use|try|do)",
+    r"\bnever\s+(use|do|add|make|create|import|call|run)\s+\S+.{0,30}(for|when|in)\b",
+    r"(?:^|\n|[.!]\s+)always\s+(use|do|add|run|prefer|set|ensure)\b",
+    r"\buse\s+\S+[,.]?\s+not\s+\S+",
+    r"\bnot\s+\S+[,.]\s+use\s+\S+",
 ]
 
 TIER4_DECISION = [
@@ -23,6 +27,9 @@ TIER4_DECISION = [
     r"\bwe('ll| will| should)\s+(use|go with)",
     r"\bdecided\s+(to|on|that)",
     r"\bthe plan is\s+to",
+    r"\bfrom now on[,.]?\s+(use|do|always)",
+    r"\bgoing forward[,.]?\s+(use|do|always|we)",
+    r"\bremember[,.]?\s+(always|never|use|don't)",
 ]
 
 SIGNALS = [

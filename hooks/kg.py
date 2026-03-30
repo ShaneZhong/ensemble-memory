@@ -6,6 +6,7 @@ All data stored in the shared SQLite database (same as db.py).
 """
 
 import json
+import logging
 import os
 import sys
 import time
@@ -13,6 +14,8 @@ import uuid
 import urllib.request
 from pathlib import Path
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 _HOOKS_DIR = Path(__file__).parent
 sys.path.insert(0, str(_HOOKS_DIR))
@@ -419,7 +422,7 @@ def kg_entity_neighborhood(
 
     eid_placeholders = ",".join("?" * len(limited_ids))
     entity_rows = conn.execute(
-        f"SELECT id, name, type, description FROM kg_entities WHERE id IN ({eid_placeholders})",
+        f"SELECT id, name, type, description, community_id FROM kg_entities WHERE id IN ({eid_placeholders})",
         list(limited_ids),
     ).fetchall()
 
@@ -479,7 +482,7 @@ def search_entities_fts(query: str, limit: int = 10) -> list:
         fts_query = query.replace('"', '""')
         rows = conn.execute(
             """
-            SELECT e.id, e.name, e.type, e.description, e.aliases
+            SELECT e.id, e.name, e.type, e.description, e.aliases, e.community_id
             FROM kg_entities e
             JOIN kg_entities_fts fts ON e.rowid = fts.rowid
             WHERE kg_entities_fts MATCH ?
@@ -495,7 +498,7 @@ def search_entities_fts(query: str, limit: int = 10) -> list:
     if not results:
         try:
             rows = conn.execute(
-                "SELECT id, name, type, description, aliases FROM kg_entities "
+                "SELECT id, name, type, description, aliases, community_id FROM kg_entities "
                 "WHERE LOWER(name) LIKE LOWER(?) OR LOWER(description) LIKE LOWER(?) "
                 "LIMIT ?",
                 (f"%{query}%", f"%{query}%", limit),
@@ -721,3 +724,177 @@ def bootstrap_from_files(file_paths: list) -> dict:
         "entities_created": entities_created,
         "relationships_created": relationships_created,
     }
+
+
+def detect_communities(max_entities: int = 5000) -> int:
+    """Run community detection on the entity-relationship graph.
+
+    Uses NetworkX Louvain if available, falls back to connected-components
+    via SQLite recursive CTE. Updates kg_entities.community_id.
+
+    Skips if entity count exceeds max_entities (performance guard).
+
+    Returns the number of communities found.
+    """
+    conn = db.get_db()
+
+    entity_count = conn.execute("SELECT COUNT(*) FROM kg_entities").fetchone()[0]
+    if entity_count == 0:
+        conn.close()
+        return 0
+    if entity_count > max_entities:
+        logger.warning(
+            "Entity count %d exceeds max_entities %d, skipping community detection",
+            entity_count, max_entities,
+        )
+        conn.close()
+        return 0
+
+    now = time.time()
+
+    # Load entities and non-expired relationships
+    entities = conn.execute("SELECT id FROM kg_entities").fetchall()
+    relationships = conn.execute(
+        "SELECT subject_id, object_id, confidence FROM kg_relationships "
+        "WHERE valid_until IS NULL OR valid_until > ?",
+        (now,),
+    ).fetchall()
+
+    entity_ids = [row["id"] for row in entities]
+
+    try:
+        import networkx as nx
+
+        G = nx.Graph()
+        G.add_nodes_from(entity_ids)
+        for rel in relationships:
+            G.add_edge(rel["subject_id"], rel["object_id"],
+                       weight=rel["confidence"] or 0.5)
+
+        communities = nx.community.louvain_communities(G, weight='weight')
+
+        for community_id, members in enumerate(communities):
+            placeholders = ",".join("?" * len(members))
+            member_list = list(members)
+            conn.execute(
+                f"UPDATE kg_entities SET community_id = ? WHERE id IN ({placeholders})",
+                [community_id] + member_list,
+            )
+        num_communities = len(communities)
+
+    except ImportError:
+        # Fallback: connected components via recursive CTE
+        logger.info("NetworkX unavailable, using CTE fallback for community detection")
+        # Build adjacency in Python from the loaded relationships
+        adjacency: dict[str, set[str]] = {eid: set() for eid in entity_ids}
+        for rel in relationships:
+            s, o = rel["subject_id"], rel["object_id"]
+            if s in adjacency and o in adjacency:
+                adjacency[s].add(o)
+                adjacency[o].add(s)
+
+        visited: set[str] = set()
+        community_id = 0
+        for eid in entity_ids:
+            if eid in visited:
+                continue
+            # BFS to find connected component
+            component = []
+            queue = [eid]
+            while queue:
+                node = queue.pop()
+                if node in visited:
+                    continue
+                visited.add(node)
+                component.append(node)
+                for neighbor in adjacency.get(node, set()):
+                    if neighbor not in visited:
+                        queue.append(neighbor)
+
+            placeholders = ",".join("?" * len(component))
+            conn.execute(
+                f"UPDATE kg_entities SET community_id = ? WHERE id IN ({placeholders})",
+                [community_id] + component,
+            )
+            community_id += 1
+
+        num_communities = community_id
+
+    conn.commit()
+    conn.close()
+    return num_communities
+
+
+def apply_relationship_decay() -> dict:
+    """Apply time-based decay to KG relationships using kg_decay_config.
+
+    For non-permanent predicates, if age exceeds decay_window_days:
+    - Reduce confidence by 50%
+    - If confidence drops below 0.1, mark as expired (set valid_until = now)
+
+    Idempotent: runs at most once per 24 hours via kg_sync_state.
+
+    Returns {'decayed': N, 'expired': N}
+    """
+    conn = db.get_db()
+    now = time.time()
+
+    # Check idempotency via kg_sync_state
+    row = conn.execute(
+        "SELECT value FROM kg_sync_state WHERE key = 'last_relationship_decay'",
+    ).fetchone()
+    if row:
+        try:
+            last_run = float(row["value"])
+            if (now - last_run) < 86400:
+                conn.close()
+                return {'decayed': 0, 'expired': 0}
+        except (ValueError, TypeError):
+            pass
+
+    # Load non-permanent decay config
+    configs = conn.execute(
+        "SELECT predicate, decay_window_days FROM kg_decay_config "
+        "WHERE decay_window_days IS NOT NULL",
+    ).fetchall()
+
+    decayed = 0
+    expired = 0
+
+    for cfg in configs:
+        predicate = cfg["predicate"]
+        window_seconds = cfg["decay_window_days"] * 86400
+        cutoff = now - window_seconds
+
+        # Find relationships past their decay window that are still active
+        rels = conn.execute(
+            "SELECT id, confidence FROM kg_relationships "
+            "WHERE predicate = ? AND valid_until IS NULL "
+            "AND created_at IS NOT NULL AND created_at < ?",
+            (predicate, cutoff),
+        ).fetchall()
+
+        for rel in rels:
+            new_confidence = rel["confidence"] * 0.5
+            decayed += 1
+            if new_confidence < 0.1:
+                conn.execute(
+                    "UPDATE kg_relationships SET confidence = ?, valid_until = ? WHERE id = ?",
+                    (new_confidence, now, rel["id"]),
+                )
+                expired += 1
+            else:
+                conn.execute(
+                    "UPDATE kg_relationships SET confidence = ? WHERE id = ?",
+                    (new_confidence, rel["id"]),
+                )
+
+    # Update sync state
+    conn.execute(
+        "INSERT OR REPLACE INTO kg_sync_state (key, value, updated_at) "
+        "VALUES ('last_relationship_decay', ?, ?)",
+        (str(now), now),
+    )
+    conn.commit()
+    conn.close()
+    return {'decayed': decayed, 'expired': expired}

@@ -145,7 +145,7 @@ All settings via environment variables or `~/.ensemble_memory/config.toml`:
 - Near-dedup via Jaccard similarity (>= 0.85) — catches rephrased duplicates
 - Embedding generated on insert (all-MiniLM-L6-v2, 384-dim)
 - **Decision vault**: typed decision index (ARCHITECTURAL, PREFERENCE, ERROR_RESOLUTION, CONSTRAINT, PATTERN) with FTS5 BM25 search
-- Reinforcement tracking (repeated patterns flag promotion candidates for CLAUDE.md)
+- **Reinforcement tracking**: repeated procedural patterns increment count, boost stability, and promote to CLAUDE.md at 5+ reinforcements
 - Human-readable markdown daily logs as source of truth
 
 ### Recall
@@ -171,6 +171,16 @@ All settings via environment variables or `~/.ensemble_memory/config.toml`:
 - **Cosine similarity** (>= 0.85): semantically similar corrections auto-supersede (Phase 2)
 - **Jaccard fallback** (>= 0.6): word-overlap supersession when no embeddings available
 - Superseded memories are retained for history but excluded from retrieval
+- **Event bus**: trilateral sync — temporal, KG, and contextual experts each process supersession events independently
+- **Chain depth pruning**: per-type limits (correction: 2, procedural: 3, semantic: 3, episodic: 5) prevent infinite chains
+
+### Lifecycle Management
+- **Reinforcement pipeline**: procedural memories tracked across sessions; stability increases at counts 2, 3, 5
+- **Promotion to CLAUDE.md**: procedural rules reinforced 5+ times within 180 days auto-promote with file locking
+- **Community detection**: NetworkX Louvain on entity-relationship graph (with SQLite CTE fallback)
+- **Relationship decay**: per-predicate TTL windows (HAS_VERSION: 30d, USES: 180d, APPLIES_TO: permanent)
+- **Garbage collection**: soft-delete via two-path eligibility (chain-pruned OR forgotten+superseded), protected memories (importance >= 9) never GC'd
+- **Background jobs**: daemon runs serialized maintenance (temporal batch, event bus, chain pruning, GC, community detection, relationship decay, promotion) every 6 hours
 
 ### Temporal Model
 - **Ebbinghaus decay**: `strength = exp(-lambda_eff * t_days)` where `lambda_eff = decay_rate * (1 - stability * 0.8)`
@@ -204,10 +214,11 @@ ensemble-memory/
 │   └── daemon_ctl.sh          # start/stop/restart/status management
 ├── hooks/
 │   ├── db.py                  # SQLite hub (schema, temporal scoring, supersession,
-│   │                          #   KG tables, decisions table + FTS5, importance decay,
-│   │                          #   near-dedup via Jaccard)
+│   │                          #   KG tables, decisions + FTS5, importance decay,
+│   │                          #   reinforcement, chain pruning, GC, temporal batch)
 │   ├── kg.py                  # Knowledge graph module (entity resolution, relationship
-│   │                          #   edges, 2-hop BFS traversal, cold-start bootstrap)
+│   │                          #   edges, 2-hop BFS, community detection, relationship decay)
+│   ├── promote.py             # CLAUDE.md promotion pipeline (file locking, idempotency)
 │   ├── embeddings.py          # Sentence-transformers wrapper (all-MiniLM-L6-v2, 384-dim)
 │   ├── triage.py              # Regex signal detection (< 5ms)
 │   ├── extract.py             # Ollama qwen2.5:3b caller with JSON validation + retry
@@ -219,7 +230,8 @@ ensemble-memory/
 │   ├── user_prompt_submit.sh/py  # UserPromptSubmit hook — thin HTTP client to daemon
 │   └── prompts/extraction.txt # LLM prompt template (memories + entities + relationships)
 ├── tests/
-│   └── test_ensemble_memory.py  # 108 tests (62 Phase 1/2 + 34 Phase 3 + 12 Phase 4)
+│   ├── test_ensemble_memory.py  # 116 tests (Phase 1-5)
+│   └── test_phase6.py           # 107 tests (Phase 6 lifecycle + e2e integration)
 ├── config/default_config.toml
 ├── install.sh
 ├── HOOKS_REFERENCE.md         # Critical: hook payload/response format docs
@@ -233,7 +245,7 @@ ensemble-memory/
 python3 tests/test_ensemble_memory.py
 ```
 
-147 tests covering:
+223 tests covering:
 - Triage: 14 tests (all regex patterns, false positive rejection, case sensitivity, user-only scanning)
 - DB: 18 tests (CRUD, temporal scoring, supersession, dedup, reinforcement, confidence fields)
 - Write Log: 5 tests (file creation, format, dedup, empty memories)
@@ -246,6 +258,7 @@ python3 tests/test_ensemble_memory.py
 - Daemon Embed Endpoints: 8 tests (/embed and /embed_batch happy path, error cases, model-unavailable 503)
 - Phase 4 Decision Vault: 12 tests (importance decay, near-dedup Jaccard, decision CRUD, BM25 search, type normalization, cross-project isolation)
 - Phase 5 Contextual Enrichment: 20 tests (validation, KG path, LLM path, batch enrichment, store_memory integration)
+- Phase 6 Lifecycle Management: 107 tests (reinforcement triple-matching/wildcards, promotion pipeline/CLAUDE.md writes, supersession event bus/trilateral sync, chain depth pruning, community detection/NetworkX fallback, relationship decay/idempotency, temporal score consolidation/batch caching, garbage collection, full lifecycle integration, daemon background jobs, e2e triage-to-store roundtrip, reinforcement-vs-supersession distinction, LLM output robustness: unicode/CJK, string importance, invalid predicates, special chars)
 
 ## Roadmap
 
@@ -258,7 +271,8 @@ python3 tests/test_ensemble_memory.py
 - [x] Phase 3: Knowledge graph (SQLite adjacency tables, entity extraction, BFS retrieval, cold-start bootstrap)
 - [x] Phase 4: Decision vault + retrieval quality (decisions table, BM25+RRF fusion, importance decay, near-dedup)
 - [x] Phase 5: Contextual enrichment (KG/LLM prefix generation, enriched embeddings, quality scoring)
-- [ ] Phase 6: Full ensemble + evolution
+- [x] Phase 6: Lifecycle management (reinforcement+promotion, supersession event bus, chain pruning, community detection, relationship decay, temporal caching, GC)
+- [ ] Phase 6b: A-MEM evolution (memory relationship classification, causal link propagation)
 
 ## Uninstall
 
