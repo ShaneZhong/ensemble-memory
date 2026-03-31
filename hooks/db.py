@@ -265,6 +265,20 @@ INSERT OR IGNORE INTO kg_sync_state VALUES
     ('last_claude_md_sync', '0', 0),
     ('last_memory_md_sync', '0', 0);
 
+-- Phase 9: Proper pipeline queue (replaces kg_sync_state queue hack for A-MEM)
+CREATE TABLE IF NOT EXISTS memory_pipeline_queue (
+    id               TEXT PRIMARY KEY,
+    session_id       TEXT NOT NULL,
+    created_at       REAL NOT NULL,
+    memory_json      TEXT NOT NULL,
+    target_expert    TEXT NOT NULL,
+    processed_at     REAL,
+    processing_error TEXT,
+    retry_count      INTEGER DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_queue_target ON memory_pipeline_queue(
+    target_expert, processed_at);
+
 -- Phase 7: A-MEM memory-to-memory evolution links
 CREATE TABLE IF NOT EXISTS amem_memory_links (
     id                  TEXT PRIMARY KEY,
@@ -388,6 +402,7 @@ def get_db() -> sqlite3.Connection:
 from db_memory import (  # noqa: E402, F401
     ensure_embedding_column,
     ensure_enrichment_columns,
+    reembed_all_memories,
     store_enrichment,
     store_embedding,
     get_memories_with_embeddings,
@@ -409,6 +424,11 @@ from db_memory import (  # noqa: E402, F401
 from db_lifecycle import (  # noqa: E402, F401
     insert_memory_link,
     get_memory_links,
+    enqueue_pipeline,
+    get_pending_pipeline,
+    complete_pipeline_item,
+    fail_pipeline_item,
+    get_pipeline_stats,
     queue_amem_evolution,
     get_pending_amem_queue,
     dequeue_amem,

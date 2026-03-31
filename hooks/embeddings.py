@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """embeddings.py — ONNX/sentence-transformers embedding service for ensemble memory.
 
-Provides lazy-loaded embedding generation using all-MiniLM-L6-v2 (384-dim, ~80MB).
+Provides lazy-loaded embedding generation using BAAI/bge-m3 (1024-dim, ~1.7GB).
 All functions degrade gracefully if sentence-transformers is not installed.
 
 Env vars:
-    ENSEMBLE_MEMORY_EMBED_MODEL   Model name (default: all-MiniLM-L6-v2)
+    ENSEMBLE_MEMORY_EMBED_MODEL   Model name (default: BAAI/bge-m3)
 """
 
 import logging
@@ -19,7 +19,8 @@ logger = logging.getLogger("ensemble_memory.embeddings")
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
-MODEL_NAME = os.environ.get("ENSEMBLE_MEMORY_EMBED_MODEL", "all-MiniLM-L6-v2")
+MODEL_NAME = os.environ.get("ENSEMBLE_MEMORY_EMBED_MODEL", "BAAI/bge-m3")
+EMBEDDING_DIM = 1024  # BGE-M3 output dimension
 
 # ── Availability check ────────────────────────────────────────────────────────
 
@@ -52,7 +53,7 @@ def _get_model() -> Optional[object]:
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def get_embedding(text: str) -> Optional[list[float]]:
-    """Generate embedding for a single text. Returns 384-dim vector or None."""
+    """Generate embedding for a single text. Returns 1024-dim vector or None."""
     model = _get_model()
     if model is None:
         return None
@@ -61,7 +62,7 @@ def get_embedding(text: str) -> Optional[list[float]]:
 
 
 def get_embeddings(texts: list[str]) -> Optional[list[list[float]]]:
-    """Generate embeddings for multiple texts (batched). Returns list of 384-dim vectors or None."""
+    """Generate embeddings for multiple texts (batched). Returns list of 1024-dim vectors or None."""
     if not texts:
         return []
     model = _get_model()

@@ -1,6 +1,6 @@
 # Ensemble Memory System — Roadmap
 
-**Last updated**: 2026-03-31
+**Last updated**: 2026-04-01
 **Spec**: `/Users/shane/Documents/playground/ai_memory/synthesis/final_design.md`
 
 ---
@@ -16,22 +16,21 @@
 | 5 | Contextual enrichment (KG prefix, LLM enrichment, re-embedding) | — | incl. in P1 |
 | 6 | Lifecycle (reinforcement, supersession, chain pruning, GC, promotion) | `e84bcd1` | 111 |
 | 7 | Recall quality & A-MEM evolution | `ebb7565` | 46 |
-| 8 | Recall Quality II — Cross-encoder & Calibration | — | 57 |
+| 8 | Recall Quality II — Cross-encoder & Calibration | `ac81c88` | 57 |
+| 9 | Embedding Upgrade & Scale (BGE-M3 1024-dim, pipeline queue) | — | 22 |
 
-**Total tests**: 380, all passing (1 pre-existing flaky test in Phase 5).
+**Total tests**: 402, all passing (1 pre-existing flaky test in Phase 5).
 
 ---
 
-## Phase 9: Embedding Upgrade & Scale
+## Phase 9.2 (Deferred): Milvus Lite Migration
 
-**Priority**: MEDIUM
-**Why**: Current 384-dim all-MiniLM-L6 is adequate but spec targets 1024-dim BGE-M3 for better multilingual + long context. Also addresses scale prep.
+**Priority**: LOW (trigger: >1K memories, currently 60)
+**Why**: SQLite cosine scan is adequate at current scale. Milvus Lite provides faster vector search but adds a dependency.
 
 | # | Task | LOC est. | Spec ref |
 |---|------|----------|----------|
-| 9.1 | **BGE-M3 1024-dim migration** — Swap embedding model. Re-embed all existing memories. Update daemon cache. Requires ~500MB model download. | ~80 + migration script | Section 3.1 |
 | 9.2 | **Milvus Lite migration** — Replace SQLite cosine scan with Milvus Lite for vector search. Keep SQLite for metadata. Threshold: >1K memories. | ~200 | Section 3.2 |
-| 9.3 | **`memory_pipeline_queue` table** — Replace kg_sync_state queue hack with proper queue table (status, retry_count, created_at, error_msg). | ~60 | Section 4.1 |
 
 ---
 
@@ -85,3 +84,6 @@
 | 2026-03-29 | Defer A-MEM to Phase 7 | Highest latency risk, untested accuracy. Lifecycle first. |
 | 2026-03-30 | `amem_memory_links` table | Separate from `kg_memory_links` (entity-level FKs). |
 | 2026-03-31 | 6h A-MEM retry interval | Matches existing daemon bg job cycle. 60s would be wasteful. |
+| 2026-04-01 | BGE-M3 over MiniLM-L6 | Chinese content support needed. 1024-dim captures more info. |
+| 2026-04-01 | Defer Milvus Lite to >1K memories | Only 60 active memories. SQLite cosine scan adequate. |
+| 2026-04-01 | Pipeline queue over kg_sync_state hack | Proper retry, error tracking, multi-expert routing. |

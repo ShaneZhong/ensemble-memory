@@ -83,60 +83,193 @@ def get_memory_links(memory_id: str) -> list[dict]:
         conn.close()
 
 
-# ── A-MEM queue operations ────────────────────────────────────────────────
+# ── Pipeline queue operations (Phase 9) ──────────────────────────────────
 
-def queue_amem_evolution(memory_id: str) -> None:
-    """Queue a memory for A-MEM relationship classification by the daemon."""
+def enqueue_pipeline(
+    session_id: str,
+    memory_json: str,
+    target_expert: str,
+) -> str:
+    """Enqueue a memory for processing by a target expert.
+
+    Args:
+        session_id: Session that produced this memory.
+        memory_json: JSON-serialized memory data.
+        target_expert: Target expert (e.g., 'amem_evolution', 'temporal',
+                       'semantic', 'knowledge_graph', 'hybrid_rag', 'contextual').
+
+    Returns:
+        Queue item ID.
+    """
+    import uuid
+    from db import get_db
+
+    queue_id = str(uuid.uuid4())
+    conn = get_db()
+    try:
+        conn.execute(
+            """
+            INSERT INTO memory_pipeline_queue
+                (id, session_id, created_at, memory_json, target_expert)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (queue_id, session_id, time.time(), memory_json, target_expert),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return queue_id
+
+
+def get_pending_pipeline(
+    target_expert: str,
+    limit: int = 10,
+    max_retries: int = 3,
+) -> list[dict]:
+    """Get unprocessed pipeline queue items for a target expert.
+
+    Returns items where processed_at IS NULL and retry_count < max_retries,
+    ordered by created_at ASC (oldest first).
+    """
+    from db import get_db
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, session_id, created_at, memory_json,
+                   target_expert, retry_count, processing_error
+            FROM memory_pipeline_queue
+            WHERE target_expert = ?
+              AND processed_at IS NULL
+              AND retry_count < ?
+            ORDER BY created_at ASC
+            LIMIT ?
+            """,
+            (target_expert, max_retries, limit),
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def complete_pipeline_item(queue_id: str) -> None:
+    """Mark a pipeline queue item as successfully processed."""
+    from db import get_db
+    conn = get_db()
+    try:
+        conn.execute(
+            "UPDATE memory_pipeline_queue SET processed_at = ? WHERE id = ?",
+            (time.time(), queue_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def fail_pipeline_item(queue_id: str, error_msg: str) -> None:
+    """Record a processing failure, incrementing retry count."""
     from db import get_db
     conn = get_db()
     try:
         conn.execute(
             """
-            INSERT OR REPLACE INTO kg_sync_state (key, value, updated_at)
-            VALUES (?, ?, ?)
+            UPDATE memory_pipeline_queue
+            SET retry_count = retry_count + 1, processing_error = ?
+            WHERE id = ?
             """,
-            (f"amem_queue_{memory_id}", memory_id, time.time()),
+            (error_msg, queue_id),
         )
         conn.commit()
     finally:
         conn.close()
 
 
-def get_pending_amem_queue(max_age_days: int = 7) -> list[tuple[str, str]]:
-    """Get pending A-MEM queue items, discarding expired ones.
+def get_pipeline_stats() -> dict:
+    """Get queue health statistics by target_expert.
 
-    Returns list of (key, memory_id) tuples.
-    Deletes items older than max_age_days.
+    Returns dict with:
+        - total: total items
+        - pending: unprocessed items
+        - completed: processed items
+        - failed: items at max retries
+        - by_expert: {expert: {pending, completed, failed}}
     """
     from db import get_db
     conn = get_db()
-    cutoff = time.time() - (max_age_days * 86400)
     try:
-        # Delete expired entries
-        conn.execute(
-            "DELETE FROM kg_sync_state WHERE key LIKE 'amem_queue_%' AND updated_at < ?",
-            (cutoff,),
-        )
-        conn.commit()
-
-        # Get remaining
         rows = conn.execute(
-            "SELECT key, value FROM kg_sync_state WHERE key LIKE 'amem_queue_%' ORDER BY updated_at ASC",
+            """
+            SELECT target_expert,
+                   COUNT(*) AS total,
+                   SUM(CASE WHEN processed_at IS NOT NULL THEN 1 ELSE 0 END) AS completed,
+                   SUM(CASE WHEN processed_at IS NULL AND retry_count < 3 THEN 1 ELSE 0 END) AS pending,
+                   SUM(CASE WHEN processed_at IS NULL AND retry_count >= 3 THEN 1 ELSE 0 END) AS failed
+            FROM memory_pipeline_queue
+            GROUP BY target_expert
+            """,
         ).fetchall()
-        return [(row["key"], row["value"]) for row in rows]
+
+        stats = {"total": 0, "pending": 0, "completed": 0, "failed": 0, "by_expert": {}}
+        for row in rows:
+            expert = row["target_expert"]
+            stats["by_expert"][expert] = {
+                "pending": row["pending"],
+                "completed": row["completed"],
+                "failed": row["failed"],
+            }
+            stats["total"] += row["total"]
+            stats["pending"] += row["pending"]
+            stats["completed"] += row["completed"]
+            stats["failed"] += row["failed"]
+        return stats
     finally:
         conn.close()
+
+
+# ── A-MEM queue operations (now backed by pipeline queue) ────────────────
+
+def queue_amem_evolution(memory_id: str) -> None:
+    """Queue a memory for A-MEM relationship classification by the daemon.
+
+    Uses the pipeline queue table (Phase 9) instead of kg_sync_state hack.
+    """
+    memory_json = json.dumps({"memory_id": memory_id})
+    enqueue_pipeline(
+        session_id="daemon",
+        memory_json=memory_json,
+        target_expert="amem_evolution",
+    )
+
+
+def get_pending_amem_queue(max_age_days: int = 7) -> list[tuple[str, str]]:
+    """Get pending A-MEM queue items.
+
+    Returns list of (queue_id, memory_id) tuples.
+    Filters out items older than max_age_days.
+    """
+    from db import get_db
+    items = get_pending_pipeline("amem_evolution", limit=50)
+    cutoff = time.time() - (max_age_days * 86400)
+
+    result = []
+    for item in items:
+        if item["created_at"] < cutoff:
+            # Expire old items by marking them as completed
+            complete_pipeline_item(item["id"])
+            continue
+        try:
+            data = json.loads(item["memory_json"])
+            memory_id = data.get("memory_id", "")
+            if memory_id:
+                result.append((item["id"], memory_id))
+        except (json.JSONDecodeError, KeyError):
+            complete_pipeline_item(item["id"])
+    return result
 
 
 def dequeue_amem(key: str) -> None:
-    """Remove a processed A-MEM queue entry."""
-    from db import get_db
-    conn = get_db()
-    try:
-        conn.execute("DELETE FROM kg_sync_state WHERE key = ?", (key,))
-        conn.commit()
-    finally:
-        conn.close()
+    """Mark a processed A-MEM queue entry as complete."""
+    complete_pipeline_item(key)
 
 
 def get_reinforcement_count(trigger_condition: str) -> int:

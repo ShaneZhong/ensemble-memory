@@ -67,7 +67,7 @@ def _load_model() -> None:
     global _model, _has_embeddings
     try:
         from sentence_transformers import SentenceTransformer
-        _model = SentenceTransformer("all-MiniLM-L6-v2")
+        _model = SentenceTransformer("BAAI/bge-m3")
         _has_embeddings = True
         logger.info("Embedding model loaded")
     except Exception as exc:
@@ -969,9 +969,9 @@ class _Handler(BaseHTTPRequestHandler):
             if not text:
                 self._send_json(400, {"error": "text required"})
                 return
-            # all-MiniLM-L6-v2 truncates at 256 tokens (~512 chars).
-            # Pre-truncate to avoid wasting time on text that won't be encoded.
-            text = text[:512]
+            # BGE-M3 handles up to 8192 tokens. Pre-truncate at ~8192 chars
+            # to avoid passing excessively long text.
+            text = text[:8192]
             embedding = _get_embedding(text)
             if embedding is None:
                 self._send_json(503, {"error": "embedding model not available"})
@@ -986,7 +986,7 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             embeddings = []
             for text in texts:
-                emb = _get_embedding(str(text)[:512])
+                emb = _get_embedding(str(text)[:8192])
                 embeddings.append(emb)
             if any(e is None for e in embeddings):
                 self._send_json(503, {"error": "embedding model not available"})

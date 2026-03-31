@@ -2,3 +2,5 @@ phase	sprint	plan_score	code_score	tests_added	tests_total	prod_loc	status	times
 8	1	9.2	9.0	14	337	80	passed	2026-03-31T20:30:00Z	Cross-encoder reranking (lazy load, feature flag, pure reorder)
 8	2	8.7	9.0	30	367	20	passed	2026-03-31T20:45:00Z	A-MEM accuracy calibration (V2 prompt, 50 ground-truth pairs, eval harness)
 8	3	8.7	9.3	13	380	55	passed	2026-03-31T21:00:00Z	SessionStart validity gates (valid_to/valid_from filters, recent context injection)
+9	1	8.5	8.5	11	391	45	passed	2026-04-01T12:00:00Z	BGE-M3 1024-dim migration (model swap, re-embed function, truncation update)
+9	2	8.5	8.5	11	402	80	passed	2026-04-01T12:30:00Z	Pipeline queue table (memory_pipeline_queue, A-MEM queue migration, stats)

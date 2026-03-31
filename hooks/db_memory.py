@@ -119,6 +119,77 @@ def ensure_enrichment_columns():
     conn.close()
 
 
+# ── Embedding migration ──────────────────────────────────────────────────────
+
+def reembed_all_memories(batch_size: int = 32) -> int:
+    """Re-embed all memories using the current embedding model.
+
+    Used when upgrading embedding models (e.g., MiniLM 384-dim → BGE-M3 1024-dim).
+    Processes in batches for efficiency. Returns count of re-embedded memories.
+    """
+    try:
+        import embeddings
+    except ImportError:
+        logger.warning("embeddings module not available, cannot re-embed")
+        return 0
+
+    from db import get_db
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, content FROM memories
+            WHERE superseded_by IS NULL AND gc_eligible = 0
+            ORDER BY created_at DESC
+            """,
+        ).fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        logger.info("No memories to re-embed")
+        return 0
+
+    total = len(rows)
+    logger.info("Re-embedding %d memories with model: %s", total, embeddings.MODEL_NAME)
+    reembedded = 0
+
+    # Process in batches
+    for i in range(0, total, batch_size):
+        batch = rows[i:i + batch_size]
+        texts = [row["content"] for row in batch]
+        ids = [row["id"] for row in batch]
+
+        try:
+            vectors = embeddings.get_embeddings(texts)
+            if vectors is None:
+                logger.warning("Embedding model unavailable, stopping re-embed at %d/%d", reembedded, total)
+                break
+
+            conn = get_db()
+            try:
+                for mem_id, vec in zip(ids, vectors):
+                    if vec is not None:
+                        conn.execute(
+                            "UPDATE memories SET embedding = ? WHERE id = ?",
+                            (json.dumps(vec), mem_id),
+                        )
+                        reembedded += 1
+                conn.commit()
+            finally:
+                conn.close()
+
+            if (i + batch_size) % 100 < batch_size:
+                logger.info("Re-embed progress: %d/%d", min(i + batch_size, total), total)
+
+        except Exception as exc:
+            logger.warning("Re-embed batch failed at offset %d: %s", i, exc)
+            continue
+
+    logger.info("Re-embedding complete: %d/%d memories updated", reembedded, total)
+    return reembedded
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def store_enrichment(memory_id: str, enriched_text: str, quality: float):
