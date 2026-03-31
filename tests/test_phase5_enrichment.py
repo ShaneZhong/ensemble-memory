@@ -136,7 +136,14 @@ class TestEnrichViaKG(unittest.TestCase):
         entity_names = ["Python", "PEP8"]
         kg_mock = MagicMock()
         kg_mock.kg_entity_neighborhood.return_value = mock_neighborhood
-        with patch.dict("sys.modules", {"kg": kg_mock}):
+
+        # Mock db to bypass cold-start guard (entity_count >= 50)
+        db_mock = MagicMock()
+        mock_conn = MagicMock()
+        mock_conn.execute.return_value.fetchone.return_value = [100]
+        db_mock.get_db.return_value = mock_conn
+
+        with patch.dict("sys.modules", {"kg": kg_mock, "db": db_mock}):
             result = enrich_mod._enrich_via_kg(
                 "Python uses 4 spaces for indentation",
                 "procedural",
