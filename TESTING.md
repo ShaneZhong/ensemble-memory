@@ -1,210 +1,124 @@
 # Ensemble Memory System — Test Results & Known Issues
 
-**Date**: 2026-03-28 (updated from 2026-03-25)
-**Phase**: Phase 3 Complete (Knowledge Graph)
-**Test Environment**: Mac Mini M4 16GB, Claude Code v2.1.81, Ollama qwen2.5:3b, sentence-transformers all-MiniLM-L6-v2
+**Date**: 2026-04-01
+**Phase**: Phase 9 Complete (Embedding Upgrade & Scale)
+**Test Environment**: Mac Mini M4 16GB, Claude Code, Ollama qwen2.5:3b, sentence-transformers BAAI/bge-m3 (1024-dim)
 
 ---
 
 ## Test Results
 
-### Automated Tests (96/96 PASS)
+### Automated Tests (402/402 PASS)
 
-Run: `cd ai_memory/ensemble-memory && python3 tests/test_ensemble_memory.py`
+Run: `cd ensemble-memory && python3 -m pytest tests/ -v`
 
-| Component | Tests | Result |
-|-----------|-------|--------|
-| Triage (regex) | 14 | ALL PASS |
-| DB (SQLite hub) | 18 | ALL PASS |
-| Write Log (markdown) | 5 | ALL PASS |
-| Session Start (loading) | 5 | ALL PASS |
-| Integration (end-to-end) | 3 | ALL PASS |
-| Embeddings | 9 | ALL PASS |
-| Query Retrieval | 5 | ALL PASS |
-| Cosine Supersession | 3 | ALL PASS |
-| Knowledge Graph (Phase 3) | 26 | ALL PASS |
-| Daemon Embed Endpoints (Phase 3) | 8 | ALL PASS |
+| Test File | Tests | Phase | Coverage |
+|-----------|-------|-------|----------|
+| test_ensemble_memory.py | 116 | 1-5 | Triage, DB, write log, session start, integration, embeddings, query retrieval, cosine supersession, knowledge graph, daemon endpoints, decision vault, contextual enrichment |
+| test_phase5_enrichment.py | 22 | 5 | KG path, LLM path, batch enrichment, store_memory integration |
+| test_phase6.py | 111 | 6 | Reinforcement, promotion, supersession event bus, chain pruning, community detection, relationship decay, GC, background jobs, e2e integration |
+| test_phase7.py | 46 | 7 | Composite scoring, recall quality, A-MEM memory links, evolution queue |
+| test_phase8.py | 27 | 8 | Cross-encoder reranking, truncation, SessionStart validity gates, recent context injection |
+| test_amem_eval.py | 30 | 8 | 50 ground-truth pairs, per-type accuracy, prompt format validation |
+| test_phase9.py | 22 | 9 | BGE-M3 model config, truncation limits, re-embed migration, pipeline queue CRUD, A-MEM queue migration |
+| test_daemon.py | 19 | 2-3 | /embed, /embed_batch endpoints, error handling |
+| test_phase4_integration.py | 9 | 4 | Decision vault + BM25 search integration |
+| **Total** | **402** | | **All passing** |
 
-### Phase 1 Live Tests (2026-03-25)
+### Historical Live Tests
 
-| Test | Input | Expected | Result | Notes |
-|------|-------|----------|--------|-------|
-| **Test 1: Correction** | "no, don't use system Python" | Tier 1 captured | **PASS** | importance 7 |
-| **Test 2: Decision** | "let's use SQLite for the database" | Tier 4 captured | **PASS** | importance 6 |
-| **Test 3: No false positive** | "can you read the file at progress.md" | No memory entry | **PASS** | Regex found no signals |
-| **Test A: SessionStart** | Start new session | Memories injected | **PASS** | Context loaded via additionalContext |
-| **Test B: Correction to SQLite** | "don't use tabs, use 4 spaces" | Captured to SQLite + markdown | **PASS** | After transcript parser fix |
-| **Test C: Supersession** | "use 2 spaces instead of 4" | Memory captured | **PARTIAL** | Captured but Jaccard too strict (0.23 < 0.6) |
-| **Test D: No false positive** | "what files are in ai_memory" | No memory stored | **PASS** | After user-only triage fix |
+These were run during early development and validated the core capture/retrieval loop.
 
-### Phase 2 Live Tests (2026-03-27/28)
+<details>
+<summary>Phase 1-3 Live Tests (2026-03-25 to 2026-03-28)</summary>
 
-| Test | Input | Expected | Result | Notes |
-|------|-------|----------|--------|-------|
-| **Test 4: Capture + embed** | "don't use print, use logging" | Captured with embedding | **PASS** | After embed-via-daemon fix |
-| **Test 5: Retrieve correction** | "how to add debug output" | Logging memory retrieved | **PASS** | Claude responded with `logging` module |
-| **Test 6: Unique memory** | "what is the project mascot?" | Retrieves "Koda the blue kangaroo" | **PASS** | Memory only in ensemble-memory, NOT in CLAUDE.md/MEMORY.md. Proves retrieval is 100% from our system |
+| Test | Input | Result | Notes |
+|------|-------|--------|-------|
+| Correction capture | "no, don't use system Python" | PASS | importance 7 |
+| Decision capture | "let's use SQLite for the database" | PASS | importance 6 |
+| No false positive | "can you read the file at progress.md" | PASS | Regex found no signals |
+| SessionStart loading | Start new session | PASS | Context loaded via additionalContext |
+| Capture + embed | "don't use print, use logging" | PASS | After embed-via-daemon fix |
+| Retrieve correction | "how to add debug output" | PASS | Claude responded with logging module |
+| Entity extraction | "don't use MySQL, use Redis" | PASS | Entities + relationships captured |
+| Entity dedup | "use Redis Stack instead of plain Redis" | PASS | Redis entity merged |
+| KG-enriched retrieval | "what cache for graph data?" | PASS | KG context injected |
+| Cold-start bootstrap | bootstrap_from_files() | PASS | 28 entities, 27 relationships |
 
-### Phase 3 Live Tests (2026-03-28)
-
-| Test | Input | Expected | Result | Notes |
-|------|-------|----------|--------|-------|
-| **Test 7: Entity extraction** | "don't use MySQL, use Redis" | Entities + relationships captured | **PASS** | After connection leak fix |
-| **Test 8: Entity dedup** | "use Redis Stack instead of plain Redis" | Redis entity merged, not duplicated | **PASS** | After exact-match-first fix |
-| **Test 9: KG-enriched retrieval** | "what cache for graph data?" | Claude cited Zephyr + Moonbeam Protocol (fictional, KG-only) | **PASS** | After keyword stemming fix |
-| **Test 10: 2-hop traversal** | "use Python for cache wrapper" | Python → Zephyr → Moonbeam chain traversed | **PASS** | |
-| **Test 11: Cold-start bootstrap** | `bootstrap_from_files(CLAUDE.md, MEMORY.md)` | 28 entities, 27 relationships extracted | **PASS** | After chunking fix |
+</details>
 
 ---
 
 ## Known Issues
 
-### HIGH — `additionalContext` is weak
+### RESOLVED — `additionalContext` is weak
 
-**Problem**: Claude Code's `additionalContext` injection from SessionStart hooks is treated as informational background, not as rules to follow. Even with "MUST FOLLOW" framing, Claude asks "database preference?" instead of automatically choosing SQLite per the standing correction.
+**Status**: Fixed in Phase 2. Query-time retrieval via embedding daemon injects relevant memories at the moment they're needed, not just at session start.
 
-**Impact**: Memories are captured but not effectively recalled. The system captures well but retrieval doesn't influence behavior.
+### LOW — Duplicate memories in markdown
 
-**Root cause**: `additionalContext` competes with CLAUDE.md, MEMORY.md, and the user's prompt. It's supplementary, not directive.
+**Problem**: The same memory can appear 2-3x in the daily markdown log when the LLM rephrases slightly.
 
-**Fix (Phase 2)**: Query-time retrieval via the embedding daemon. When user mentions "database", relevant memories are retrieved at that moment and injected into the current context. Phase 3 further enriches this with KG neighborhood context.
+**Mitigation**: Content-hash dedup at SQLite level prevents duplicate DB entries. Markdown logs may have near-duplicates but the retrieval system deduplicates.
 
-### MEDIUM — Duplicate memories in markdown
+### LOW — Sessions table sparse
 
-**Problem**: The same memory appears 2-3x in the daily markdown log across different sessions. The Stop hook fires in this session AND sometimes in concurrent sessions, both processing similar turns.
+**Problem**: `sessions` table is not consistently populated.
 
-**Impact**: Noisy daily logs, wasted storage.
-
-**Root cause**: The dedup in `write_log.py` checks exact content match, but the LLM sometimes rephrases slightly. Also, the same turn can be processed by multiple concurrent sessions' hooks.
-
-**Fix needed**: Tighter dedup — use content_hash (SHA-256) stored alongside entries, check before writing. Or dedup at the SQLite level (already done) and skip markdown write for known duplicates.
-
-### MEDIUM — Dirty content in SQLite
-
-**Problem**: One memory has `- [importance 8] Actually use SQLite...` as content — the markdown formatting prefix leaked into the extracted content.
-
-**Impact**: Formatting artifacts in stored memories, compounding on each injection cycle.
-
-**Root cause**: The formatted output from `session_start.py` was captured by the Stop hook of a session that logged what it received, feeding the formatted text back through extraction.
-
-**Fix needed**: Strip markdown formatting prefixes from extracted content before storing. Add a content sanitizer in `store_memory.py`.
-
-### LOW — Sessions table empty
-
-**Problem**: `db.record_session()` is never called successfully. The sessions table has no rows despite multiple sessions running.
-
-**Impact**: Cannot track which sessions generated which memories. Minor for now.
-
-**Root cause**: `session_start.py` calls `db.record_session()` but the function signature may have a mismatch, or the call path has an exception being swallowed.
-
-**Fix needed**: Debug the call path, check function signature matches.
+**Impact**: Minor — session tracking is supplementary to memory capture.
 
 ### INFO — Extraction latency
 
-**Observation**: Ollama extraction takes 6-13 seconds per turn (average ~9s). One 30-second timeout was hit. Cold model load adds 2-5s on first call per session.
+**Observation**: Ollama extraction takes 6-13 seconds per turn (average ~9s). Not user-facing (runs via Stop hook).
 
-**Impact**: Not user-facing (hook runs async-ish via Stop hook), but affects how quickly memories appear in the log.
-
-**Mitigation**: Already using `format: "json"` constrained generation. Consider keeping model warm with `OLLAMA_KEEP_ALIVE=300s` instead of default 60s.
-
----
-
-## Extraction Stats Summary
-
-| Metric | Value |
-|--------|-------|
-| Total extractions attempted | ~15 |
-| Success rate | ~90% (13/15) |
-| Average latency (success) | ~9.2s |
-| Timeouts | 2 (30s limit) |
-| JSON validation failures | 0 |
-| Retries needed | 0 |
+**Mitigation**: Regex triage gate (<5ms) ensures LLM only fires on memory-worthy turns. Pipeline queue provides retry for timeouts.
 
 ---
 
 ## How to Verify
 
 ```bash
+# Run all tests
+python3 -m pytest tests/ -v
+
 # Check today's markdown log
 cat ~/.ensemble_memory/memory/$(date +%Y-%m-%d).md
 
 # Check SQLite memories
 python3 -c "
-import sqlite3
+import sqlite3, json
 conn = sqlite3.connect('\$HOME/.ensemble_memory/memory.db')
 conn.row_factory = sqlite3.Row
-for r in conn.execute('SELECT substr(content,1,60) as content, memory_type, importance, superseded_by FROM memories ORDER BY created_at'):
+for r in conn.execute('SELECT substr(content,1,60) as content, memory_type, importance FROM memories WHERE superseded_by IS NULL AND gc_eligible = 0 ORDER BY created_at DESC LIMIT 10'):
     print(dict(r))
+"
+
+# Check embedding dimensions
+python3 -c "
+import sqlite3, json
+conn = sqlite3.connect('\$HOME/.ensemble_memory/memory.db')
+row = conn.execute('SELECT embedding FROM memories WHERE embedding IS NOT NULL LIMIT 1').fetchone()
+print(f'Embedding dim: {len(json.loads(row[0]))}')
+"
+
+# Check pipeline queue health
+python3 -c "
+import sys; sys.path.insert(0, 'hooks')
+import db
+print(db.get_pipeline_stats())
 "
 
 # Check extraction stats
 cat ~/.ensemble_memory/logs/extraction_stats.jsonl | tail -10
-
-# Check SessionStart debug log
-cat ~/.ensemble_memory/logs/session_start_debug.log
-
-# Run automated tests
-cd /Users/shane/Documents/playground/ai_memory/ensemble-memory
-python3 tests/test_ensemble_memory.py
-```
-
----
-
-## Architecture (Current State)
-
-```
-Claude Code Session
-    |
-    v
-[SessionStart hook] ──> session_start.sh ──> session_start.py
-    │                     reads SQLite (importance >= 7)
-    │                     outputs {"additionalContext": "..."}
-    │                     (injected silently into system prompt)
-    |
-    v
-[User types a prompt]
-    |
-    v
-[UserPromptSubmit hook] ──> user_prompt_submit.sh ──> HTTP POST /search (daemon)
-    │                          extracts keywords from prompt
-    │                          ├── cosine similarity search (embeddings)
-    │                          └── KG neighborhood lookup
-    │                               (keyword → FTS5 → BFS 2-hop)
-    │                          injects memories + KG context via hookSpecificOutput
-    |
-    v
-[Each agent response]
-    |
-    v
-[Stop hook] ──> stop.sh ──> triage.py (< 5ms)
-                                |
-                          signal? ──no──> done
-                                |
-                               yes
-                                |
-                                v
-                          extract.py (Ollama qwen2.5:3b, ~9s)
-                          (returns memories + entities + relationships)
-                                |
-                                v
-                          store_memory.py
-                            ├── SQLite insert (db.py)
-                            │   ├── content_hash dedup
-                            │   ├── temporal metadata
-                            │   ├── supersession detection
-                            │   └── reinforcement tracking
-                            ├── KG upsert (kg.py)
-                            │   ├── entity resolution + dedup
-                            │   └── relationship edge insert
-                            └── Markdown write (write_log.py)
-                                ├── daily YYYY-MM-DD.md
-                                └── content dedup
 ```
 
 ---
 
 ## Next Steps
 
-1. Phase 4: Nightly batch processor (async transcript scan for missed turns)
-2. Phase 5: Public skill installer (`/plugin install ensemble-memory`)
-3. Known issues tracked below still apply to Phase 3
+See [docs/roadmap.md](docs/roadmap.md) for the full roadmap. Key upcoming phases:
+
+- **Phase 9.2**: Milvus Lite vector search (deferred until >1K memories)
+- **Phase 10**: PreCompact hook, ClawMem session tables
+- **Phase 11**: Health dashboard, memory browser, export/import
+- **Phase 12**: Multi-project federation

@@ -2,6 +2,8 @@
 
 A 100% free, local memory system for AI coding agents. Captures corrections, decisions, and insights from your sessions automatically — then retrieves them semantically when relevant. Zero API cost, runs entirely on your machine.
 
+Supports **100+ languages** including Chinese, Japanese, and Korean via BGE-M3 multilingual embeddings.
+
 ## How It Works
 
 ```
@@ -9,13 +11,14 @@ Claude Code session
     |
     v
 [SessionStart hook] ──> Load standing rules (importance >= 7) ──> Inject into context
-    |
+    |                    + recent context (semantic/episodic)
     v
 [User types a prompt]
     |
     v
 [UserPromptSubmit hook] ──> Query daemon ──> Find similar memories ──> Inject relevant ones
-    |                        (~50ms)          (cosine similarity)       via hookSpecificOutput
+    |                        (~50ms)          (RRF: cosine + BM25      via hookSpecificOutput
+    |                                         + cross-encoder rerank)
     |                                              |
     |                                              v
     |                                   [KG neighborhood lookup]
@@ -40,13 +43,14 @@ Claude Code session
                                               |
                                               v
                                    [Daemon /embed + /invalidate_cache]
+                                   [A-MEM evolution queue]
 ```
 
 **Three hooks + one daemon:**
-1. **SessionStart** — loads standing rules as baseline context
+1. **SessionStart** — loads standing rules + recent context as baseline
 2. **UserPromptSubmit** — queries the embedding daemon for semantically relevant memories
 3. **Stop** — captures new corrections and decisions after each response
-4. **Embedding daemon** — persistent background process (port 9876) that loads the ML model once (~200MB), serves embedding + search requests in ~50ms
+4. **Embedding daemon** — persistent background process (port 9876) that loads BGE-M3 (~600MB RAM), cross-encoder reranker, and serves embedding + search requests in ~50ms
 
 ## What Gets Captured
 
@@ -65,7 +69,7 @@ Claude Code session
 
 - **Ollama** with `qwen2.5:3b` model (~1.9GB)
 - **Python 3.10+**
-- **sentence-transformers** (`pip install sentence-transformers`) — for semantic search
+- **sentence-transformers** (`pip install sentence-transformers`) — for BGE-M3 embeddings (~1.7GB first download)
 - **Claude Code** with hooks support
 
 ## Install
@@ -129,11 +133,13 @@ All settings via environment variables or `~/.ensemble_memory/config.toml`:
 | `ENSEMBLE_MEMORY_LOGS` | `~/.ensemble_memory/memory/` | Daily log output |
 | `OLLAMA_HOST` | `http://localhost:11434` | Ollama API endpoint |
 | `ENSEMBLE_MEMORY_MODEL` | `qwen2.5:3b` | Ollama model for extraction |
-| `ENSEMBLE_MEMORY_EMBED_MODEL` | `all-MiniLM-L6-v2` | Embedding model |
+| `ENSEMBLE_MEMORY_EMBED_MODEL` | `BAAI/bge-m3` | Embedding model (1024-dim, multilingual) |
 | `ENSEMBLE_MEMORY_TIMEOUT` | `30` | Extraction timeout (seconds) |
 | `ENSEMBLE_MEMORY_PYTHON` | `python3` | Python interpreter path |
 | `ENSEMBLE_MEMORY_ENRICH_ENABLED` | `1` | Enable contextual enrichment (0 to disable) |
 | `ENSEMBLE_MEMORY_MIN_ENRICH_IMPORTANCE` | `6` | Minimum importance for enrichment |
+| `ENSEMBLE_MEMORY_CROSS_ENCODER` | `1` | Enable cross-encoder reranking (0 to disable) |
+| `ENSEMBLE_MEMORY_COMPOSITE_SCORING` | `1` | Use weighted composite scoring (0 for legacy) |
 
 ## Features
 
@@ -143,14 +149,17 @@ All settings via environment variables or `~/.ensemble_memory/config.toml`:
 - SQLite hub with full temporal metadata (decay rates, stability, supersession chains)
 - Content-hash dedup at SQLite level (no duplicate memories)
 - Near-dedup via Jaccard similarity (>= 0.85) — catches rephrased duplicates
-- Embedding generated on insert (all-MiniLM-L6-v2, 384-dim)
+- Embedding generated on insert (BAAI/bge-m3, 1024-dim, 100+ languages)
 - **Decision vault**: typed decision index (ARCHITECTURAL, PREFERENCE, ERROR_RESOLUTION, CONSTRAINT, PATTERN) with FTS5 BM25 search
 - **Reinforcement tracking**: repeated procedural patterns increment count, boost stability, and promote to CLAUDE.md at 5+ reinforcements
+- **Pipeline queue**: typed routing to expert processors with retry logic and error tracking
 - Human-readable markdown daily logs as source of truth
 
 ### Recall
-- **SessionStart**: loads standing corrections and rules (importance >= 7) as baseline context
-- **UserPromptSubmit**: hybrid retrieval — RRF fusion of cosine similarity + BM25 keyword search + temporal decay + importance scoring. Injects only relevant memories as context BEFORE Claude responds
+- **SessionStart**: loads standing corrections and rules (importance >= 7) + recent semantic/episodic context as baseline. Validity gates exclude expired/future memories.
+- **UserPromptSubmit**: hybrid retrieval — RRF fusion of cosine similarity + BM25 keyword search + temporal decay + importance scoring. Optional cross-encoder reranking (top-20 → top-5). Injects only relevant memories as context BEFORE Claude responds.
+- **Cross-encoder reranking**: `cross-encoder/ms-marco-MiniLM-L-6-v2` reranks top RRF results for precision (opt-in per query)
+- **Composite scoring**: weighted sum of RRF (0.5), temporal (0.3), importance (0.2) with confidence modulation
 - Temporal decay scoring (ACT-R Petrov + Ebbinghaus forgetting curve) weights fresher memories higher
 - **Importance decay**: memories not accessed in 30 days lose 1 importance point (floor at 3), keeping retrieval surface fresh
 
@@ -166,9 +175,15 @@ All settings via environment variables or `~/.ensemble_memory/config.toml`:
 - **Decay config**: per-predicate decay windows (e.g. `HAS_VERSION` = 30 days, `APPLIES_TO` = permanent)
 - **Episode tracking**: `kg_episodes` table records session turns; `kg_appears_in` links entities to episodes
 
+### A-MEM Evolution
+- **Memory relationship classification**: Ollama classifies semantic relationships between memories (SUPPORTS, REFINES, CONTRADICTS, SUPERSEDES, EVOLVED_FROM, ENABLES, CAUSED_BY, RELATED)
+- **V2 prompt**: few-shot classification with strength calibration guidance
+- **Async queue**: memories queued for evolution via pipeline queue, processed by daemon background jobs
+- **Accuracy evaluation**: 50 ground-truth pairs covering all 8 link types
+
 ### Supersession
 - **Structured**: same subject + predicate → old fact automatically superseded
-- **Cosine similarity** (>= 0.85): semantically similar corrections auto-supersede (Phase 2)
+- **Cosine similarity** (>= 0.85): semantically similar corrections auto-supersede
 - **Jaccard fallback** (>= 0.6): word-overlap supersession when no embeddings available
 - Superseded memories are retained for history but excluded from retrieval
 - **Event bus**: trilateral sync — temporal, KG, and contextual experts each process supersession events independently
@@ -180,7 +195,7 @@ All settings via environment variables or `~/.ensemble_memory/config.toml`:
 - **Community detection**: NetworkX Louvain on entity-relationship graph (with SQLite CTE fallback)
 - **Relationship decay**: per-predicate TTL windows (HAS_VERSION: 30d, USES: 180d, APPLIES_TO: permanent)
 - **Garbage collection**: soft-delete via two-path eligibility (chain-pruned OR forgotten+superseded), protected memories (importance >= 9) never GC'd
-- **Background jobs**: daemon runs serialized maintenance (temporal batch, event bus, chain pruning, GC, community detection, relationship decay, promotion) every 6 hours
+- **Background jobs**: daemon runs serialized maintenance (temporal batch, event bus, chain pruning, GC, community detection, relationship decay, promotion, A-MEM evolution) every 6 hours
 
 ### Temporal Model
 - **Ebbinghaus decay**: `strength = exp(-lambda_eff * t_days)` where `lambda_eff = decay_rate * (1 - stability * 0.8)`
@@ -207,72 +222,74 @@ Full design: [final_design.md](../synthesis/final_design.md) (1,931 lines)
 ```
 ensemble-memory/
 ├── daemon/
-│   ├── embedding_daemon.py    # Persistent HTTP server (port 9876, ~200MB RAM)
-│   │                          #   endpoints: /search (RRF fusion), /embed,
-│   │                          #   /embed_batch, /invalidate_cache, /health,
-│   │                          #   /log_feedback
+│   ├── embedding_daemon.py    # Persistent HTTP server (port 9876, ~600MB RAM)
+│   │                          #   BGE-M3 embeddings + cross-encoder reranker
+│   │                          #   endpoints: /search (RRF fusion + rerank),
+│   │                          #   /embed, /embed_batch, /invalidate_cache,
+│   │                          #   /health, /status, /log_feedback
 │   └── daemon_ctl.sh          # start/stop/restart/status management
 ├── hooks/
-│   ├── db.py                  # SQLite hub (schema, temporal scoring, supersession,
-│   │                          #   KG tables, decisions + FTS5, importance decay,
-│   │                          #   reinforcement, chain pruning, GC, temporal batch)
-│   ├── kg.py                  # Knowledge graph module (entity resolution, relationship
-│   │                          #   edges, 2-hop BFS, community detection, relationship decay)
-│   ├── promote.py             # CLAUDE.md promotion pipeline (file locking, idempotency)
-│   ├── embeddings.py          # Sentence-transformers wrapper (all-MiniLM-L6-v2, 384-dim)
+│   ├── db.py                  # SQLite hub (schema, connection, DDL, re-exports)
+│   ├── db_memory.py           # Memory CRUD, embedding, enrichment, supersession
+│   ├── db_lifecycle.py        # Reinforcement, pipeline queue, chain pruning, GC
+│   ├── db_decisions.py        # Decision vault CRUD + BM25 search
+│   ├── kg.py                  # Knowledge graph (entity resolution, BFS, communities)
+│   ├── evolution.py           # A-MEM relationship classification via Ollama
+│   ├── promote.py             # CLAUDE.md promotion pipeline (file locking)
+│   ├── enrich.py              # Contextual enrichment (KG prefix + LLM)
+│   ├── embeddings.py          # Sentence-transformers wrapper (BAAI/bge-m3, 1024-dim)
 │   ├── triage.py              # Regex signal detection (< 5ms)
-│   ├── extract.py             # Ollama qwen2.5:3b caller with JSON validation + retry
-│   │                          #   (returns memories + entities + relationships)
+│   ├── extract.py             # Ollama qwen2.5:3b caller with JSON validation
 │   ├── write_log.py           # Markdown daily log writer with dedup
 │   ├── store_memory.py        # SQLite + embedding + markdown orchestrator
-│   ├── session_start.sh/py    # SessionStart hook — load standing rules
+│   ├── session_start.sh/py    # SessionStart hook — load standing rules + recent context
 │   ├── stop.sh                # Stop hook — capture corrections + decisions
 │   ├── user_prompt_submit.sh/py  # UserPromptSubmit hook — thin HTTP client to daemon
-│   └── prompts/extraction.txt # LLM prompt template (memories + entities + relationships)
-├── tests/
-│   ├── test_ensemble_memory.py  # 116 tests (Phase 1-5)
-│   └── test_phase6.py           # 107 tests (Phase 6 lifecycle + e2e integration)
+│   └── prompts/extraction.txt # LLM prompt template
+├── scripts/
+│   └── migrate_embeddings.py  # Re-embed all memories (for model upgrades)
+├── tests/                     # 402 tests across 7 test files
+├── sprints/                   # AutoShip sprint research + plans
+├── docs/roadmap.md            # Phase roadmap + decision log
 ├── config/default_config.toml
 ├── install.sh
-├── HOOKS_REFERENCE.md         # Critical: hook payload/response format docs
-├── PHASE2_REVIEW.md           # Code review findings
-└── TESTING.md
+└── HOOKS_REFERENCE.md         # Hook payload/response format docs
 ```
 
 ## Tests
 
 ```bash
-python3 tests/test_ensemble_memory.py
+python3 -m pytest tests/ -v
 ```
 
-223 tests covering:
-- Triage: 14 tests (all regex patterns, false positive rejection, case sensitivity, user-only scanning)
-- DB: 18 tests (CRUD, temporal scoring, supersession, dedup, reinforcement, confidence fields)
-- Write Log: 5 tests (file creation, format, dedup, empty memories)
-- Session Start: 5 tests (loading, filtering, grouping, format)
-- Integration: 3 tests (store + load roundtrip, supersession, full pipeline)
-- Embeddings: 9 tests (generation, dimension, similarity, batch, find_similar)
-- Query Retrieval: 5 tests (relevant/irrelevant queries, multiple results, embedding storage)
-- Cosine Supersession: 3 tests (similar supersedes, unrelated doesn't, Jaccard fallback)
-- Knowledge Graph: 26 tests (entity upsert/dedup/merge, relationship CRUD, predicate normalization, BFS traversal, FTS5 search, episode recording, bootstrap, extraction prompt format)
-- Daemon Embed Endpoints: 8 tests (/embed and /embed_batch happy path, error cases, model-unavailable 503)
-- Phase 4 Decision Vault: 12 tests (importance decay, near-dedup Jaccard, decision CRUD, BM25 search, type normalization, cross-project isolation)
-- Phase 5 Contextual Enrichment: 20 tests (validation, KG path, LLM path, batch enrichment, store_memory integration)
-- Phase 6 Lifecycle Management: 107 tests (reinforcement triple-matching/wildcards, promotion pipeline/CLAUDE.md writes, supersession event bus/trilateral sync, chain depth pruning, community detection/NetworkX fallback, relationship decay/idempotency, temporal score consolidation/batch caching, garbage collection, full lifecycle integration, daemon background jobs, e2e triage-to-store roundtrip, reinforcement-vs-supersession distinction, LLM output robustness: unicode/CJK, string importance, invalid predicates, special chars)
+402 tests, all passing:
+- **Phase 1-5** (116 tests): triage, DB CRUD, temporal scoring, supersession, dedup, embeddings, query retrieval, knowledge graph, decision vault, contextual enrichment
+- **Phase 5 Enrichment** (22 tests): KG path, LLM path, batch enrichment, store_memory integration
+- **Phase 6 Lifecycle** (111 tests): reinforcement, promotion, supersession event bus, chain pruning, community detection, relationship decay, GC, background jobs, e2e integration
+- **Phase 7 Recall + A-MEM** (46 tests): composite scoring, recall quality, A-MEM memory links, evolution queue
+- **Phase 8 Cross-encoder + Calibration** (27 tests): cross-encoder reranking, truncation, A-MEM V2 prompt, SessionStart validity gates, recent context injection
+- **Phase 8 A-MEM Eval** (30 tests): 50 ground-truth pairs, per-type accuracy, prompt format validation
+- **Phase 9 Embedding Upgrade** (22 tests): BGE-M3 model config, truncation limits, re-embed migration, pipeline queue CRUD, A-MEM queue migration
+- **Daemon** (19 tests): /embed, /embed_batch endpoints, error handling
+- **Phase 4 Integration** (9 tests): decision vault + BM25 search integration
 
 ## Roadmap
 
 - [x] Phase 1: Capture pipeline (regex triage → Ollama extraction → SQLite + markdown)
-- [x] Phase 1: SessionStart loading (importance >= 7 standing rules)
-- [x] Phase 2: Semantic search (sentence-transformers embeddings, cosine similarity)
-- [x] Phase 2: Query-time retrieval (UserPromptSubmit hook via embedding daemon)
-- [x] Phase 2: Cosine supersession (replaces Jaccard for embedded memories)
-- [x] Phase 2: Persistent embedding daemon (port 9876, auto-start, 30min idle shutdown)
-- [x] Phase 3: Knowledge graph (SQLite adjacency tables, entity extraction, BFS retrieval, cold-start bootstrap)
-- [x] Phase 4: Decision vault + retrieval quality (decisions table, BM25+RRF fusion, importance decay, near-dedup)
-- [x] Phase 5: Contextual enrichment (KG/LLM prefix generation, enriched embeddings, quality scoring)
-- [x] Phase 6: Lifecycle management (reinforcement+promotion, supersession event bus, chain pruning, community detection, relationship decay, temporal caching, GC)
-- [ ] Phase 6b: A-MEM evolution (memory relationship classification, causal link propagation)
+- [x] Phase 2: Semantic search (embedding daemon, cosine similarity, cosine supersession)
+- [x] Phase 3: Knowledge graph (entity extraction, BFS traversal, FTS5, cold-start bootstrap)
+- [x] Phase 4: Decision vault (typed decisions, BM25+RRF fusion, importance decay)
+- [x] Phase 5: Contextual enrichment (KG/LLM prefix generation, enriched embeddings)
+- [x] Phase 6: Lifecycle management (reinforcement, promotion, event bus, chain pruning, community detection, GC)
+- [x] Phase 7: Recall quality + A-MEM evolution (composite scoring, memory relationship classification)
+- [x] Phase 8: Cross-encoder reranking + A-MEM calibration (V2 prompt, validity gates, recent context)
+- [x] Phase 9: Embedding upgrade (BGE-M3 1024-dim multilingual, pipeline queue table)
+- [ ] Phase 9.2: Milvus Lite vector search (deferred until >1K memories)
+- [ ] Phase 10: Hooks & capture completeness (PreCompact hook, ClawMem session tables)
+- [ ] Phase 11: Monitoring & operations (health dashboard, memory browser, export/import)
+- [ ] Phase 12: Multi-project federation (cross-project query, memory sharing)
+
+See [docs/roadmap.md](docs/roadmap.md) for detailed task breakdown and decision log.
 
 ## Uninstall
 
