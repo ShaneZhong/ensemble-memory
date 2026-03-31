@@ -190,3 +190,8 @@ fi
 # ── Write new memories to the daily log ──────────────────────────────────────
 export TRANSCRIPT_PATH
 "$PYTHON3" "${HOOKS_DIR}/write_log.py" "$FILTERED_EXTRACTION" "$SESSION_ID" 2>>"$DEBUG_LOG" || true
+
+# ── Write new memories to SQLite (safety-net → recall) ───────────────────
+# Dedup by content_hash against existing DB memories. Non-fatal: markdown
+# is already written above, SQLite is best-effort.
+"$PYTHON3" "${HOOKS_DIR}/session_end.py" "$FILTERED_EXTRACTION" "$SESSION_ID" 2>>"$DEBUG_LOG" || true

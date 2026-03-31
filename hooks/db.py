@@ -265,6 +265,21 @@ INSERT OR IGNORE INTO kg_sync_state VALUES
     ('last_claude_md_sync', '0', 0),
     ('last_memory_md_sync', '0', 0);
 
+-- Phase 7: A-MEM memory-to-memory evolution links
+CREATE TABLE IF NOT EXISTS amem_memory_links (
+    id                  TEXT PRIMARY KEY,
+    source_memory_id    TEXT NOT NULL REFERENCES memories(id),
+    target_memory_id    TEXT NOT NULL REFERENCES memories(id),
+    link_type           TEXT NOT NULL
+                        CHECK(link_type IN ('RELATED','CONTRADICTS','SUPERSEDES',
+                              'EVOLVED_FROM','SUPPORTS','REFINES','ENABLES',
+                              'CAUSED_BY')),
+    strength            REAL DEFAULT 0.5,
+    created_at          REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_amem_link_source ON amem_memory_links(source_memory_id);
+CREATE INDEX IF NOT EXISTS idx_amem_link_target ON amem_memory_links(target_memory_id);
+
 -- Phase 4: Decision Vault (lean structured index over memories)
 CREATE TABLE IF NOT EXISTS decisions (
     id                TEXT PRIMARY KEY,
@@ -391,6 +406,11 @@ from db_memory import (  # noqa: E402, F401
 )
 
 from db_lifecycle import (  # noqa: E402, F401
+    insert_memory_link,
+    get_memory_links,
+    queue_amem_evolution,
+    get_pending_amem_queue,
+    dequeue_amem,
     get_reinforcement_count,
     get_reinforcement_match,
     increment_reinforcement,

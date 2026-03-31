@@ -76,7 +76,7 @@ def _store_to_sqlite(memories: list[dict], session_id: str, entities_raw: list[d
         # similarity, then LIKE substring fallback.
         # Runs BEFORE insert: if reinforced, skip inserting a duplicate.
         if mem_type in ("procedural", "correction"):
-            match_text = mem.get("rule", "") or content
+            match_text = mem.get("trigger_condition", "") or mem.get("rule", "") or content
             try:
                 count, existing_id = db.get_reinforcement_match(
                     match_text=match_text,
@@ -167,6 +167,12 @@ def _store_to_sqlite(memories: list[dict], session_id: str, entities_raw: list[d
             )
             if superseded:
                 superseded_ids.append(superseded)
+
+        # ── Queue for A-MEM evolution (async via daemon) ──────────────────────
+        try:
+            db.queue_amem_evolution(mem_id)
+        except Exception:
+            pass  # A-MEM queue is best-effort
 
         # ── Decision vault write (if decision_type present) ──────────────────
         # Fallback: if LLM put a decision type in "type" field instead of

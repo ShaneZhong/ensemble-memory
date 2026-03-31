@@ -387,6 +387,42 @@ def _bm25_search(query: str, project: str, limit: int = 20) -> list[dict]:
     return results
 
 
+def composite_score(
+    rrf_score: float,
+    temporal_score: float,
+    importance: int,
+    confidence: float = 1.0,
+) -> float:
+    """Composite scoring: weighted sum of RRF, temporal, and importance.
+
+    Replaces the old multiplicative formula. Key improvement: confidence
+    (reduced on contradiction) now affects ranking.
+
+    Args:
+        rrf_score: Normalized RRF from fusion
+        temporal_score: From db.temporal_score() [0, 1]
+        importance: Memory importance [1, 10]
+        confidence: Retrieval confidence [0, 1], reduced on contradiction
+
+    Returns:
+        Final score in [0, ~1].
+    """
+    w_semantic = 0.5
+    w_temporal = 0.3
+    w_importance = 0.2
+
+    importance_score = importance / 10.0
+
+    final = (
+        w_semantic * rrf_score
+        + w_temporal * temporal_score
+        + w_importance * importance_score
+    )
+    final *= max(0.0, min(1.0, confidence))
+
+    return final
+
+
 def _search(query: str, project: str) -> dict:
     """Core search logic with RRF fusion. Returns {"hits": [...], "context": "..."}."""
     memories = _load_memories(project)
@@ -397,14 +433,22 @@ def _search(query: str, project: str) -> dict:
 
     # ── Signal 1: Cosine similarity ranking ─────────────────────────────
     cosine_ranked = []
+    now = time.time()
     for mem in memories:
         if mem.get("memory_type") not in RETRIEVABLE_TYPES:
+            continue
+        # Validity gates: exclude superseded, gc_eligible, or expired memories
+        if mem.get("superseded_by") is not None:
+            continue
+        if mem.get("gc_eligible", 0) == 1:
+            continue
+        valid_to = mem.get("valid_to")
+        if valid_to is not None and valid_to < now:
             continue
         # Use cached temporal_score if computed within 6 hours
         _CACHE_FRESHNESS = 21600  # 6 hours in seconds
         cached_score = mem.get("temporal_score")
         computed_at = mem.get("score_computed_at")
-        now = time.time()
         if (cached_score is not None
                 and computed_at is not None
                 and (now - computed_at) < _CACHE_FRESHNESS):
@@ -424,11 +468,14 @@ def _search(query: str, project: str) -> dict:
             "content": mem.get("content", ""),
             "memory_type": mem.get("memory_type", ""),
             "importance": mem.get("importance", 5),
+            "confidence": mem.get("confidence", 1.0),
             "subject": mem.get("subject"),
             "similarity": sim,
             "temporal_score": t_score,
+            "source": "cosine",
             **{k: mem[k] for k in ("access_count", "last_accessed_at", "created_at",
-                                    "decay_rate", "stability") if k in mem},
+                                    "decay_rate", "stability", "superseded_by",
+                                    "gc_eligible", "valid_to") if k in mem},
         })
 
     cosine_ranked.sort(key=lambda x: x["similarity"], reverse=True)
@@ -463,14 +510,19 @@ def _search(query: str, project: str) -> dict:
             }
 
     # Build final scored list
+    use_composite = os.environ.get("ENSEMBLE_MEMORY_COMPOSITE_SCORING", "1") == "1"
     scored = []
     for mid, rrf_score in rrf_scores.items():
         item = all_items[mid]
         t_score = item.get("temporal_score", 0.5)
-        importance = item.get("importance", 5) / 10.0
+        importance_raw = item.get("importance", 5)
+        confidence = item.get("confidence", 1.0) or 1.0
 
-        # Final score: RRF * (temporal + importance blend)
-        final = rrf_score * (0.4 + t_score * 0.3 + importance * 0.3)
+        if use_composite:
+            final = composite_score(rrf_score, t_score, importance_raw, confidence)
+        else:
+            # Legacy formula (pre-Phase 7)
+            final = rrf_score * (0.4 + t_score * 0.3 + (importance_raw / 10.0) * 0.3)
 
         scored.append({
             **item,
@@ -516,6 +568,129 @@ def _format_context(hits: list[dict]) -> str:
 _bg_timer = None
 _daemon_start_time: float = 0.0
 _last_bg_job_time: float | None = None
+
+
+def _process_amem_queue():
+    """Process pending A-MEM evolution queue items.
+
+    For each queued memory, find similar memories via embedding search,
+    classify relationships via Ollama, and write to kg_memory_links.
+    Wrapped in own try/except so failures don't break the timer chain.
+    """
+    import db
+
+    pending = db.get_pending_amem_queue(max_age_days=7)
+    if not pending:
+        return
+
+    try:
+        import evolution
+    except ImportError:
+        logger.warning("[daemon] evolution module not available, skipping A-MEM")
+        return
+
+    processed = 0
+    for queue_key, memory_id in pending:
+        try:
+            # Get the memory content
+            conn = db.get_db()
+            try:
+                row = conn.execute(
+                    "SELECT content FROM memories WHERE id = ?",
+                    (memory_id,),
+                ).fetchone()
+            finally:
+                conn.close()
+
+            if not row:
+                db.dequeue_amem(queue_key)
+                continue
+
+            content = row["content"]
+
+            # Find similar memories via embedding search
+            similar = _find_similar_for_amem(memory_id, content)
+            if not similar:
+                db.dequeue_amem(queue_key)
+                continue
+
+            # Classify relationships
+            relationships = evolution.classify_relationships(
+                memory_id, content, similar,
+            )
+
+            # Write to amem_memory_links
+            for rel in relationships:
+                db.insert_memory_link(
+                    source_memory_id=rel["source_entity_id"],
+                    target_memory_id=rel["target_entity_id"],
+                    link_type=rel["link_type"],
+                    strength=rel["strength"],
+                )
+                logger.info(
+                    "[daemon] A-MEM link: %s -[%s]-> %s (%.2f)",
+                    memory_id[:8], rel["link_type"],
+                    rel["target_entity_id"][:8], rel["strength"],
+                )
+
+            db.dequeue_amem(queue_key)
+            processed += 1
+
+        except Exception as exc:
+            # Leave in queue for retry — 7-day expiry will clean up
+            logger.warning(
+                "[daemon] A-MEM failed for %s: %s", memory_id[:8], exc,
+            )
+
+    if processed > 0:
+        logger.info("[daemon] A-MEM: processed %d/%d queued memories", processed, len(pending))
+
+
+def _find_similar_for_amem(memory_id: str, content: str) -> list[dict]:
+    """Find top-5 similar memories for A-MEM classification (excluding self)."""
+    import db
+
+    # Use the daemon's own embedding infrastructure
+    embedding = _get_embedding(content)
+    if embedding is None:
+        return []
+
+    conn = db.get_db()
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, content, embedding FROM memories
+            WHERE id != ? AND embedding IS NOT NULL
+              AND superseded_by IS NULL AND gc_eligible = 0
+            ORDER BY created_at DESC
+            LIMIT 50
+            """,
+            (memory_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        return []
+
+    import json as _json
+    try:
+        from embeddings import cosine_similarity
+    except ImportError:
+        return []
+
+    scored = []
+    for row in rows:
+        try:
+            cand_emb = _json.loads(row["embedding"])
+            sim = cosine_similarity(embedding, cand_emb)
+            if sim >= 0.3:  # Low threshold — Ollama will judge relevance
+                scored.append({"id": row["id"], "content": row["content"], "score": sim})
+        except (ValueError, TypeError):
+            continue
+
+    scored.sort(key=lambda x: x["score"], reverse=True)
+    return scored[:5]
 
 
 def _run_background_jobs():
@@ -581,6 +756,12 @@ def _run_background_jobs():
                            decay_stats['decayed'], decay_stats['expired'])
         except Exception as exc:
             logger.warning("[daemon] Relationship decay failed: %s", exc)
+
+        # 8. A-MEM evolution (process queued memories)
+        try:
+            _process_amem_queue()
+        except Exception as exc:
+            logger.warning("[daemon] A-MEM evolution failed: %s", exc)
 
         _last_bg_job_time = time.time()
     except Exception as exc:

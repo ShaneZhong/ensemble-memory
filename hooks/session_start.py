@@ -137,6 +137,33 @@ def main() -> None:
     except Exception:
         pass
 
+    # Add recent decisions from decision vault (most recent by project)
+    try:
+        conn = db.get_db()
+        try:
+            rows = conn.execute(
+                """
+                SELECT d.decision_type, m.content
+                FROM decisions d
+                JOIN memories m ON m.id = d.memory_id
+                WHERE d.project = ?
+                ORDER BY d.created_at DESC
+                LIMIT 3
+                """,
+                (project,),
+            ).fetchall()
+        finally:
+            conn.close()
+        if rows:
+            dec_lines = ["\n\n## Recent Decisions"]
+            for row in rows:
+                dtype = row["decision_type"]
+                content = row["content"].strip()[:200]
+                dec_lines.append(f"- **[{dtype}]** {content}")
+            context += "\n".join(dec_lines)
+    except Exception:
+        pass
+
     result = {"additionalContext": context}
     print(json.dumps(result, ensure_ascii=False))
 

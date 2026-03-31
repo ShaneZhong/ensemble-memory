@@ -14,6 +14,131 @@ from typing import Optional
 logger = logging.getLogger("ensemble_memory.db")
 
 
+# ── A-MEM memory links ────────────────────────────────────────────────────
+
+def insert_memory_link(
+    source_memory_id: str,
+    target_memory_id: str,
+    link_type: str,
+    strength: float = 0.5,
+) -> str:
+    """Insert a relationship between two memories into amem_memory_links.
+
+    Returns the link ID. Skips if an identical link already exists.
+    """
+    import uuid
+    from evolution import _VALID_LINK_TYPES
+
+    if link_type not in _VALID_LINK_TYPES:
+        link_type = "RELATED"
+
+    from db import get_db
+    conn = get_db()
+    try:
+        # Idempotency: skip if exact link exists
+        existing = conn.execute(
+            """
+            SELECT id FROM amem_memory_links
+            WHERE source_memory_id = ? AND target_memory_id = ? AND link_type = ?
+            """,
+            (source_memory_id, target_memory_id, link_type),
+        ).fetchone()
+        if existing:
+            return existing["id"]
+
+        link_id = str(uuid.uuid4())
+        conn.execute(
+            """
+            INSERT INTO amem_memory_links (id, source_memory_id, target_memory_id,
+                                           link_type, strength, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (link_id, source_memory_id, target_memory_id, link_type, strength, time.time()),
+        )
+        conn.commit()
+        return link_id
+    finally:
+        conn.close()
+
+
+def get_memory_links(memory_id: str) -> list[dict]:
+    """Get all memory links where this memory is source or target.
+
+    Returns list of dicts with: id, source_memory_id, target_memory_id,
+    link_type, strength, created_at.
+    """
+    from db import get_db
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, source_memory_id, target_memory_id, link_type, strength, created_at
+            FROM amem_memory_links
+            WHERE source_memory_id = ? OR target_memory_id = ?
+            """,
+            (memory_id, memory_id),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+# ── A-MEM queue operations ────────────────────────────────────────────────
+
+def queue_amem_evolution(memory_id: str) -> None:
+    """Queue a memory for A-MEM relationship classification by the daemon."""
+    from db import get_db
+    conn = get_db()
+    try:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO kg_sync_state (key, value, updated_at)
+            VALUES (?, ?, ?)
+            """,
+            (f"amem_queue_{memory_id}", memory_id, time.time()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_pending_amem_queue(max_age_days: int = 7) -> list[tuple[str, str]]:
+    """Get pending A-MEM queue items, discarding expired ones.
+
+    Returns list of (key, memory_id) tuples.
+    Deletes items older than max_age_days.
+    """
+    from db import get_db
+    conn = get_db()
+    cutoff = time.time() - (max_age_days * 86400)
+    try:
+        # Delete expired entries
+        conn.execute(
+            "DELETE FROM kg_sync_state WHERE key LIKE 'amem_queue_%' AND updated_at < ?",
+            (cutoff,),
+        )
+        conn.commit()
+
+        # Get remaining
+        rows = conn.execute(
+            "SELECT key, value FROM kg_sync_state WHERE key LIKE 'amem_queue_%' ORDER BY updated_at ASC",
+        ).fetchall()
+        return [(row["key"], row["value"]) for row in rows]
+    finally:
+        conn.close()
+
+
+def dequeue_amem(key: str) -> None:
+    """Remove a processed A-MEM queue entry."""
+    from db import get_db
+    conn = get_db()
+    try:
+        conn.execute("DELETE FROM kg_sync_state WHERE key = ?", (key,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def get_reinforcement_count(trigger_condition: str) -> int:
     """Count non-superseded memories whose content contains trigger_condition.
 
