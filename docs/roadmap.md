@@ -16,23 +16,9 @@
 | 5 | Contextual enrichment (KG prefix, LLM enrichment, re-embedding) | — | incl. in P1 |
 | 6 | Lifecycle (reinforcement, supersession, chain pruning, GC, promotion) | `e84bcd1` | 111 |
 | 7 | Recall quality & A-MEM evolution | `ebb7565` | 46 |
+| 8 | Recall Quality II — Cross-encoder & Calibration | — | 57 |
 
-**Total tests**: 323, all passing.
-
----
-
-## Phase 8: Recall Quality II — Cross-encoder & Calibration
-
-**Priority**: HIGH
-**Why**: Biggest remaining recall quality gap. Spec says cross-encoder reranking is required for Stop hook retrieval. A-MEM accuracy is uncalibrated.
-
-| # | Task | LOC est. | Spec ref |
-|---|------|----------|----------|
-| 8.1 | **Cross-encoder reranking** — Deploy ms-marco-MiniLM-L-6-v2 (~85MB) via sentence-transformers. Rerank top-20 RRF results to top-5. Only in Stop hook path (not UserPromptSubmit — too slow). | ~100 | Section 6.2 |
-| 8.2 | **A-MEM accuracy calibration** — Build eval harness: 50 memory pairs with ground-truth labels. Measure classification accuracy. Tune Ollama prompt until >70%. | ~150 | Section 7.3 |
-| 8.3 | **SessionStart validity gates** — Filter loaded standing rules through temporal validity (exclude expired `valid_to`). Add semantic recent context injection (top 30 lines, importance >= 5). | ~60 | Section 5.1 |
-
-**Constraint**: Cross-encoder adds ~85MB RAM + ~200ms per rerank. Must coexist with Ollama on Mac Mini M4 16GB.
+**Total tests**: 380, all passing (1 pre-existing flaky test in Phase 5).
 
 ---
 

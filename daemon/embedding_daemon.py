@@ -55,6 +55,10 @@ TYPE_LABEL = {
 _model = None          # sentence_transformers.SentenceTransformer or None
 _has_embeddings = False
 
+_cross_encoder = None  # sentence_transformers.CrossEncoder or None
+_has_cross_encoder = False
+_cross_encoder_lock = threading.Lock()
+
 _memories_cache: list[dict] = []
 _cache_loaded_at: float = 0.0
 
@@ -80,6 +84,79 @@ def _get_embedding(text: str) -> list[float] | None:
         return vec.tolist()
     except Exception:
         return None
+
+
+def _load_cross_encoder() -> None:
+    """Lazily load the cross-encoder model (thread-safe)."""
+    global _cross_encoder, _has_cross_encoder
+    with _cross_encoder_lock:
+        if _cross_encoder is not None:
+            return
+        if os.environ.get("ENSEMBLE_MEMORY_CROSS_ENCODER", "1") != "1":
+            _has_cross_encoder = False
+            return
+        try:
+            from sentence_transformers import CrossEncoder
+            _cross_encoder = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+            _has_cross_encoder = True
+            logger.info("Cross-encoder model loaded")
+        except Exception as exc:
+            _cross_encoder = None
+            _has_cross_encoder = False
+            logger.warning("Cross-encoder unavailable (%s), reranking disabled", exc)
+
+
+def _truncate_for_rerank(content: str, subject: str | None) -> str:
+    """Truncate long content for cross-encoder input.
+
+    For content >600 chars: use subject as heading + first 200 chars.
+    """
+    if len(content) <= 600:
+        return content
+    prefix = f"{subject}: " if subject else ""
+    return prefix + content[:200]
+
+
+def _cross_encoder_rerank(
+    query: str,
+    candidates: list[dict],
+    top_n: int = TOP_K,
+) -> list[dict]:
+    """Rerank candidates using cross-encoder. Returns top_n results.
+
+    Falls back to returning candidates unchanged if cross-encoder unavailable.
+    """
+    if not candidates:
+        return candidates
+
+    candidates = list(candidates)  # defensive copy — avoid mutating caller's list
+
+    _load_cross_encoder()
+    if not _has_cross_encoder or _cross_encoder is None:
+        return candidates[:top_n]
+
+    # Build query-document pairs
+    pairs = []
+    for c in candidates:
+        doc = _truncate_for_rerank(
+            c.get("content", ""),
+            c.get("subject"),
+        )
+        pairs.append([query, doc])
+
+    try:
+        scores = _cross_encoder.predict(pairs)
+        for i, c in enumerate(candidates):
+            c["cross_encoder_score"] = float(scores[i])
+        candidates.sort(key=lambda x: x["cross_encoder_score"], reverse=True)
+        reranked = candidates[:top_n]
+        # Replace final_score with cross-encoder score (pure reorder)
+        for item in reranked:
+            item["final_score"] = item["cross_encoder_score"]
+        return reranked
+    except Exception as exc:
+        logger.warning("Cross-encoder reranking failed: %s", exc)
+        return candidates[:top_n]
 
 
 def _cosine_similarity(a: list[float], b: list[float]) -> float:
@@ -423,8 +500,15 @@ def composite_score(
     return final
 
 
-def _search(query: str, project: str) -> dict:
-    """Core search logic with RRF fusion. Returns {"hits": [...], "context": "..."}."""
+def _search(query: str, project: str, rerank: bool = False) -> dict:
+    """Core search logic with RRF fusion + optional cross-encoder reranking.
+
+    Args:
+        query: Search query text.
+        project: Project path for filtering.
+        rerank: If True, apply cross-encoder reranking to top-20 RRF results.
+                Default False (UserPromptSubmit). Stop hook callers pass True.
+    """
     memories = _load_memories(project)
     if not memories:
         return {"hits": [], "context": ""}
@@ -531,7 +615,12 @@ def _search(query: str, project: str) -> dict:
         })
 
     scored.sort(key=lambda x: x["final_score"], reverse=True)
-    hits = scored[:TOP_K]
+
+    # ── Optional cross-encoder reranking (Stop hook only) ─────────────
+    if rerank and os.environ.get("ENSEMBLE_MEMORY_CROSS_ENCODER", "1") == "1":
+        hits = _cross_encoder_rerank(query, scored[:20], top_n=TOP_K)
+    else:
+        hits = scored[:TOP_K]
 
     if not hits:
         return {"hits": [], "context": ""}
@@ -861,10 +950,11 @@ class _Handler(BaseHTTPRequestHandler):
             body    = self._read_body()
             query   = body.get("query", "")
             project = body.get("project", "")
+            rerank  = bool(body.get("rerank", False))
             if not query:
                 self._send_json(400, {"error": "query required"})
                 return
-            result = _search(query, project)
+            result = _search(query, project, rerank=rerank)
             self._send_json(200, result)
 
         elif self.path == "/invalidate_cache":

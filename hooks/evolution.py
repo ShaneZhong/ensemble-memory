@@ -11,6 +11,7 @@ Link types (matching kg_memory_links.link_type CHECK constraint):
 
 import json
 import logging
+import os
 import time
 import urllib.request
 from typing import Optional
@@ -54,6 +55,50 @@ RULES:
 - Output empty list if no meaningful relationships exist.
 """
 
+# V2 prompt with few-shot examples for improved classification accuracy
+_CLASSIFICATION_PROMPT_V2 = """\
+You are a memory relationship classifier. Given a NEW memory and EXISTING memories, classify how they relate.
+
+RELATIONSHIP TYPES:
+- SUPPORTS: new reinforces existing ("Always use pytest" supports "Use pytest fixtures for setup")
+- REFINES: new adds detail to existing ("Use pytest with -x flag" refines "Use pytest for tests")
+- CONTRADICTS: new conflicts with existing ("Use unittest" contradicts "Never use unittest")
+- SUPERSEDES: new replaces existing ("Use SQLite not PostgreSQL" supersedes "Use PostgreSQL")
+- EVOLVED_FROM: new builds on existing ("Add cross-encoder reranking" evolved from "Implement RRF fusion")
+- ENABLES: new makes existing possible ("Install sentence-transformers" enables "Use cross-encoder")
+- CAUSED_BY: new was caused by existing ("FK constraint error" caused by "Wrong table referenced")
+- RELATED: general connection, no stronger type fits
+
+EXAMPLES:
+New: "Always use ruff for linting, never flake8"
+Existing: [ID: abc] "Use flake8 for Python linting"
+Output: {{"relationships": [{{"existing_id": "abc", "link_type": "SUPERSEDES", "strength": 0.9}}]}}
+
+New: "pytest fixtures should use function scope by default"
+Existing: [ID: def] "Always use pytest for testing"
+Output: {{"relationships": [{{"existing_id": "def", "link_type": "REFINES", "strength": 0.7}}]}}
+
+New: "The build passed all 323 tests"
+Existing: [ID: ghi] "Use SQLite for the database"
+Output: {{"relationships": []}}
+
+NOW CLASSIFY:
+NEW MEMORY:
+{new_content}
+
+EXISTING MEMORIES:
+{existing_list}
+
+Output ONLY valid JSON:
+{{"relationships": [{{"existing_id": "ID", "link_type": "TYPE", "strength": 0.0-1.0}}]}}
+
+STRENGTH CALIBRATION:
+- 0.8-1.0: Obvious, clear relationship (e.g., direct contradiction or replacement)
+- 0.5-0.7: Moderate relationship (e.g., one refines the other)
+- 0.3-0.5: Weak but real connection (e.g., related topic)
+- Below 0.3: Skip — not worth recording
+"""
+
 
 def classify_relationships(
     new_memory_id: str,
@@ -82,7 +127,9 @@ def classify_relationships(
         existing_lines.append(f"{i}. [ID: {mem_id}] {content}")
         valid_ids.add(mem_id)
 
-    prompt = _CLASSIFICATION_PROMPT.format(
+    use_v2 = os.environ.get("ENSEMBLE_MEMORY_AMEM_PROMPT_V2", "1") == "1"
+    template = _CLASSIFICATION_PROMPT_V2 if use_v2 else _CLASSIFICATION_PROMPT
+    prompt = template.format(
         new_content=new_content,
         existing_list="\n".join(existing_lines),
     )

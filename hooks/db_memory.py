@@ -439,13 +439,17 @@ def get_memories_for_session_start(
 ) -> list[dict]:
     """Return procedural + correction memories for session priming.
 
-    Filters by importance >= min_importance, excludes superseded and gc_eligible
-    rows. Applies Ebbinghaus + ACT-R temporal scoring and returns results ordered
+    Filters by importance >= min_importance, excludes superseded, gc_eligible,
+    expired (valid_to < now), and future (valid_from > now) memories.
+    Applies Ebbinghaus + ACT-R temporal scoring and returns results ordered
     by temporal_score descending.
     """
+    import time as _time
+
     from db import get_db
     conn = get_db()
-    params: list = [min_importance]
+    now = _time.time()
+    params: list = [min_importance, now, now]
     project_clause = ""
     if project:
         # Prefix match: memories stored under /foo/bar/baz are found
@@ -463,6 +467,8 @@ def get_memories_for_session_start(
           AND importance >= ?
           AND superseded_by IS NULL
           AND gc_eligible = 0
+          AND (valid_to IS NULL OR valid_to > ?)
+          AND (valid_from IS NULL OR valid_from <= ?)
           {project_clause}
         ORDER BY importance DESC, created_at DESC
         LIMIT 200
@@ -485,6 +491,55 @@ def get_memories_for_session_start(
 
     conn.close()
     results.sort(key=lambda x: x["temporal_score"], reverse=True)
+    return results
+
+
+def get_recent_context(
+    project: Optional[str] = None,
+    limit: int = 30,
+    min_importance: int = 5,
+    exclude_ids: Optional[set] = None,
+) -> list[dict]:
+    """Return recent semantic + episodic memories for context injection.
+
+    Complements get_memories_for_session_start() by providing recent non-rule
+    memories. Excludes IDs already loaded as standing rules to avoid duplication.
+    """
+    import time as _time
+
+    from db import get_db
+    conn = get_db()
+    now = _time.time()
+    params: list = [min_importance, now, now]
+    project_clause = ""
+    if project:
+        project_clause = "AND (project = ? OR project LIKE ? || '/%' OR ? LIKE project || '/%')"
+        params.extend([project, project, project])
+    params.append(limit)
+
+    rows = conn.execute(
+        f"""
+        SELECT id, content, memory_type, importance, subject, created_at
+        FROM memories
+        WHERE memory_type IN ('semantic', 'episodic')
+          AND importance >= ?
+          AND superseded_by IS NULL
+          AND gc_eligible = 0
+          AND (valid_to IS NULL OR valid_to > ?)
+          AND (valid_from IS NULL OR valid_from <= ?)
+          {project_clause}
+        ORDER BY created_at DESC
+        LIMIT ?
+        """,
+        params,
+    ).fetchall()
+    conn.close()
+
+    results = []
+    for row in rows:
+        if exclude_ids and row["id"] in exclude_ids:
+            continue
+        results.append(dict(row))
     return results
 
 

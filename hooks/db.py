@@ -395,6 +395,7 @@ from db_memory import (  # noqa: E402, F401
     detect_supersession,
     detect_content_supersession,
     get_memories_for_session_start,
+    get_recent_context,
     record_session,
     end_session,
     temporal_score,

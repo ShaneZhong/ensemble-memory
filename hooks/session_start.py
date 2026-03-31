@@ -137,6 +137,22 @@ def main() -> None:
     except Exception:
         pass
 
+    # Add recent semantic/episodic context (Phase 8.3)
+    try:
+        standing_ids = {m["id"] for m in memories}
+        recent = db.get_recent_context(
+            project=project, limit=30, min_importance=5,
+            exclude_ids=standing_ids,
+        )
+        if recent:
+            context += "\n\n## Recent Context"
+            for mem in recent:
+                content = mem.get("content", "").strip()[:200]
+                mtype = mem.get("memory_type", "semantic")
+                context += f"\n- **[{mtype}]** {content}"
+    except Exception:
+        pass
+
     # Add recent decisions from decision vault (most recent by project)
     try:
         conn = db.get_db()

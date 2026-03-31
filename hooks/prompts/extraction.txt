@@ -19,6 +19,9 @@ conversation turn and extract important memories. Output ONLY valid JSON.
       "predicate": "relationship (e.g. 'should_use', 'must_not_use')",
       "object": "target value (e.g. 'SQLite', '3.11')",
       "rule": "for procedural: imperative rule statement, else null",
+      "trigger_condition": "when this rule applies (e.g., 'when writing Python tests')",
+      "anti_pattern": "what NOT to do (e.g., 'import unittest')",
+      "correct_pattern": "what TO do (e.g., 'import pytest')",
       "what_went_wrong": "for corrections: what went wrong, else null",
       "how_it_was_resolved": "for corrections: how it was fixed, else null",
       "decision_type": "ARCHITECTURAL | PREFERENCE | ERROR_RESOLUTION | CONSTRAINT | PATTERN | null (set this when the user makes a decision; type must STILL be correction/semantic/procedural)"
