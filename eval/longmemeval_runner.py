@@ -244,6 +244,9 @@ def run_eval(
         per_ability[ability]["total"] += 1
         per_ability[ability]["correct"] += label
 
+        # Save hit contents for retrieval quality analysis
+        hit_contents = [h.get("content", "")[:200] for h in hits[:5]]
+
         result = {
             "question_id": question_id,
             "question_type": question_type,
@@ -257,6 +260,8 @@ def run_eval(
             "generation_ms": round(generation_ms, 1),
             "judge_ms": round(judge_ms, 1),
             "num_hits": len(hits),
+            "retrieved_context": context[:2000],
+            "hit_contents": hit_contents,
         }
         results.append(result)
 
