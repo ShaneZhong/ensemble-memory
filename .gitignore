@@ -2,3 +2,5 @@ __pycache__/
 *.pyc
 *.pyo
 .DS_Store
+eval/longmemeval_oracle.json
+eval/longmemeval_results_*.json

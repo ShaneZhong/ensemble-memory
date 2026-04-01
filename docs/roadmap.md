@@ -18,8 +18,9 @@
 | 7 | Recall quality & A-MEM evolution | `ebb7565` | 46 |
 | 8 | Recall Quality II — Cross-encoder & Calibration | `ac81c88` | 57 |
 | 9 | Embedding Upgrade & Scale (BGE-M3 1024-dim, pipeline queue) | — | 22 |
+| E1 | LongMemEval evaluation harness (adapter, runner, judge) | — | 23 |
 
-**Total tests**: 402, all passing (1 pre-existing flaky test in Phase 5).
+**Total tests**: 425, all passing.
 
 ---
 

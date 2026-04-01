@@ -420,9 +420,11 @@ def _bm25_search(query: str, project: str, limit: int = 20) -> list[dict]:
 
         if keywords:
             seen_ids = {r["id"] for r in results}
+            # Limit to 5 keywords before building clauses
+            keywords = keywords[:5]
             # Build OR conditions for keyword matching
             like_clauses = " OR ".join(["content LIKE ?" for _ in keywords])
-            like_params: list = [f"%{kw}%" for kw in keywords[:5]]  # limit to 5 keywords
+            like_params: list = [f"%{kw}%" for kw in keywords]
 
             params_m: list = []
             proj_clause_m = ""

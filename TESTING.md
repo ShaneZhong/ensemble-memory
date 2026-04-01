@@ -1,14 +1,14 @@
 # Ensemble Memory System — Test Results & Known Issues
 
 **Date**: 2026-04-01
-**Phase**: Phase 9 Complete (Embedding Upgrade & Scale)
+**Phase**: Phase E1 Complete (LongMemEval Evaluation Harness)
 **Test Environment**: Mac Mini M4 16GB, Claude Code, Ollama qwen2.5:3b, sentence-transformers BAAI/bge-m3 (1024-dim)
 
 ---
 
 ## Test Results
 
-### Automated Tests (402/402 PASS)
+### Automated Tests (425/425 PASS)
 
 Run: `cd ensemble-memory && python3 -m pytest tests/ -v`
 
@@ -21,9 +21,10 @@ Run: `cd ensemble-memory && python3 -m pytest tests/ -v`
 | test_phase8.py | 27 | 8 | Cross-encoder reranking, truncation, SessionStart validity gates, recent context injection |
 | test_amem_eval.py | 30 | 8 | 50 ground-truth pairs, per-type accuracy, prompt format validation |
 | test_phase9.py | 22 | 9 | BGE-M3 model config, truncation limits, re-embed migration, pipeline queue CRUD, A-MEM queue migration |
+| test_longmemeval.py | 23 | E1 | Timestamp parsing, ingestion, isolation, importance scoring, judge prompts, ability mapping, context formatting, dataset dedup |
 | test_daemon.py | 19 | 2-3 | /embed, /embed_batch endpoints, error handling |
 | test_phase4_integration.py | 9 | 4 | Decision vault + BM25 search integration |
-| **Total** | **402** | | **All passing** |
+| **Total** | **425** | | **All passing** |
 
 ### Historical Live Tests
 
